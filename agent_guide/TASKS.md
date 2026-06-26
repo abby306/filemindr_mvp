@@ -10,15 +10,22 @@ Live backlog. Move items between sections; keep entries one line. `[ ]` todo, `[
 - [x] `setup.md` + project docs (AGENTS/PRD/ARCHITECTURE/TECH_SPEC/TASKS/CODING_STANDARDS/API_CONTRACTS).
 
 ## In progress
-- [~] Apply baseline schema (Alembic `0001` / `schema.sql`) at `vector(768)`; verify in DBeaver.
+- [x] Apply baseline schema (Alembic `0001` / `schema.sql`) at `vector(768)` — applied (21 tables + `v_document_pipeline`, `vector` 0.8.3, plans seeded).
 
 ## Done (recent)
 - [x] Lock embedding model → `bge-base-en-v1.5`, `vector(768)`; install `sentence-transformers`.
 
 ## Next up
-- [ ] Schema as Alembic migration: identity/tenancy + documents/card + vector + observability tables + `v_document_pipeline`.
-- [ ] Account scoping at data layer (RLS or mandatory scoping function).
-- [ ] FastAPI skeleton: settings (pydantic-settings), DB session, health endpoint.
+- [x] Schema as Alembic migration: identity/tenancy + documents/card + vector + observability tables + `v_document_pipeline`.
+- [x] Account scoping at data layer — **mandatory scoping function** (`AccountScope`/`get_current_account`); RLS deferred.
+- [x] FastAPI skeleton: settings (pydantic-settings), DB session, health endpoint.
+- [x] Phase 1 foundations: ORM models (document-core), minimal bearer-token auth, `GET /api/v1/me`, seed script (personal + company + default classes), unit tests (config/DB/scoping/routes — 19 passing).
+
+### Phase 1 follow-ups
+- [ ] Map remaining tables in `models.py` (chat, observability, billing) as their phases arrive.
+- [ ] Replace dev bearer-token auth with a real mechanism (session/JWT); decide on RLS as defence-in-depth.
+- [ ] Add `CODING_STANDARDS.md` (referenced by AGENTS/CLAUDE but missing on disk).
+- [ ] Fix `ARCHITECTURE.md` embeddings line (says `bge-small`/384-d; should be `bge-base`/768-d).
 
 ## Backlog — by build phase
 **Ingest**
