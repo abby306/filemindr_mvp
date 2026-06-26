@@ -77,7 +77,9 @@ class Account(Base):
     created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
     updated_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
 
-    members: Mapped[list["AccountMember"]] = relationship(back_populates="account")
+    members: Mapped[list["AccountMember"]] = relationship(
+        back_populates="account", passive_deletes=True
+    )
 
 
 class User(Base):
@@ -91,7 +93,9 @@ class User(Base):
     created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
     updated_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
 
-    memberships: Mapped[list["AccountMember"]] = relationship(back_populates="user")
+    memberships: Mapped[list["AccountMember"]] = relationship(
+        back_populates="user", passive_deletes=True
+    )
 
 
 class AccountMember(Base):
