@@ -4,4 +4,7 @@ __pycache__/
 .env
 secrets/
 storage/
+*credentials*.json
+*-key.json
+*_key.json
 .pytest_cache/
