@@ -59,6 +59,10 @@ date_role_enum = _pg_enum(
 value_type_enum = _pg_enum(
     "money", "number", "date", "id", "string", name="value_type"
 )
+event_stage_enum = _pg_enum(
+    "received", "ocr", "extraction", "embedding", "indexing", name="event_stage"
+)
+event_status_enum = _pg_enum("started", "succeeded", "failed", name="event_status")
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
@@ -266,4 +270,23 @@ class DocumentFact(Base):
     bbox: Mapped[dict | None] = mapped_column(JSONB)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(768))
     # `fts` is a generated tsvector column owned by Postgres — read-only here.
+    created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+
+
+# --- pipeline observability (append-only) ---------------------------------
+class ProcessingEvent(Base):
+    __tablename__ = "processing_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    stage: Mapped[str] = mapped_column(event_stage_enum, nullable=False)
+    status: Mapped[str] = mapped_column(event_status_enum, nullable=False)
+    detail: Mapped[dict | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))

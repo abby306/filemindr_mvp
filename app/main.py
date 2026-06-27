@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.documents import router as documents_router
 from app.core.config import get_settings
 from app.core.scoping import AccountScope, get_current_account
 from app.db.session import engine
@@ -19,6 +20,8 @@ from app.db.session import engine
 settings = get_settings()
 
 app = FastAPI(title="filemindr", version="0.1.0")
+
+app.include_router(documents_router)
 
 
 @app.get("/health", tags=["ops"])

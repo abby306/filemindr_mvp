@@ -7,6 +7,7 @@ Schema, environment, and implementation detail. Living document — add/adjust c
 - DB: PostgreSQL 16 + pgvector (extension name `vector`). Native now → `pgvector/pgvector:pg16` at MVP.
 - Cache/queue: Redis (`localhost:6379`), used once workers exist.
 - Stack (backend): FastAPI, SQLAlchemy + psycopg, Alembic, Pydantic / pydantic-settings.
+- OCR libs: PyMuPDF (`fitz`) for text-layer probe + rasterization, `google-cloud-vision`, `python-docx`; `langdetect` for language detection (Vision locale preferred when available).
 - Stack (frontend): Next.js + TypeScript, Tailwind (design tokens as CSS vars), Radix UI, Framer Motion, Recharts/Visx, TanStack Query. Tokens & specs in `FRONTEND.md`.
 - Connection: `postgresql+psycopg://filemindr:localdev@localhost:5432/filemindr`.
 

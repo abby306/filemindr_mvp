@@ -29,12 +29,12 @@ Live backlog. Move items between sections; keep entries one line. `[ ]` todo, `[
 
 ## Backlog — by build phase
 **Ingest**
-- [ ] Web upload endpoint (PDF/PNG/JPG/docx); persist raw file; hash dedup; `received` status.
+- [x] Web upload endpoint (PDF/PNG/JPG/docx); persist raw file (sha256, atomic write); hash dedup; `received` status; `GET /documents` + `GET /documents/{id}` (account-scoped, keyset paginated).
 - [ ] Email-in pipeline (per-account alias; parse attachments + body).
 
 **OCR**
-- [ ] PDF text-layer probe (fitz) → Google Vision fallback; docx extract; image → Vision.
-- [ ] OCR cache keyed by file hash; language detection; keep bboxes.
+- [x] PDF text-layer probe (fitz) → Google Vision fallback; docx extract; image → Vision. Runs as a FastAPI BackgroundTask (Redis worker later).
+- [x] OCR cache keyed by file hash; language detection (langdetect / Vision locale); keep Vision block bboxes; `processing_events` logged; status → `ocr_done` (or `failed`).
 
 **Extraction**
 - [ ] Structured-output schema + single cheap LLM pass → card + atomic facts.
