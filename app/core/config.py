@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     # External providers (blank until set in .env)
     openai_api_key: str = ""
     deepseek_api_key: str = ""
+    gemini_api_key: str = ""
     google_application_credentials: str = "./secrets/vision-credentials.json"
+
+    # Extraction model (DeepSeek, via the OpenAI-compatible client)
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_model: str = "deepseek-chat"
 
     # Local filesystem + runtime
     storage_dir: str = "./storage"

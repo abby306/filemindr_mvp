@@ -342,6 +342,14 @@ def run_ocr(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
                 },
             )
             db.commit()
+
+            # Chain extraction now that the document is at `ocr_done`. Local
+            # import avoids an import cycle (extraction imports this module for
+            # bbox provenance). run_extraction opens its own session and handles
+            # its own failures, so it never disturbs the committed OCR result.
+            from app.services import extraction
+
+            extraction.run_extraction(document_id, account_id)
         except Exception as exc:  # noqa: BLE001 — record any failure, don't crash the worker
             db.rollback()
             document = db.get(Document, document_id)

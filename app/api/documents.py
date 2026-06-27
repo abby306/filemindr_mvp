@@ -25,11 +25,28 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import tuple_
+from sqlalchemy import func, tuple_
 
-from app.api.schemas import DocumentListOut, DocumentOut
+from app.api.schemas import (
+    ClassCardOut,
+    DateCardOut,
+    DocumentCardOut,
+    DocumentListOut,
+    DocumentOut,
+    EntitiesCardOut,
+    TypedFactCardOut,
+)
 from app.core.scoping import AccountScope, get_current_account
-from app.db.models import Document
+from app.db.models import (
+    Class,
+    Document,
+    DocumentClass,
+    DocumentDate,
+    DocumentEntity,
+    DocumentFact,
+    Entity,
+    TypedFact,
+)
 from app.services import ocr
 from app.services.events import record_event
 from app.services.storage import save_upload
@@ -167,12 +184,16 @@ def list_documents(
     )
 
 
-@router.get("/documents/{document_id}", response_model=DocumentOut)
+@router.get("/documents/{document_id}", response_model=DocumentCardOut)
 def get_document(
     document_id: uuid.UUID,
     scope: AccountScope = Depends(get_current_account),
-) -> DocumentOut:
-    """Fetch one document by id, scoped to the active account (404 otherwise)."""
+) -> DocumentCardOut:
+    """Fetch one document's full card by id, scoped to the active account.
+
+    Returns 404 for another account's document. Card sections are empty until
+    extraction has run.
+    """
     document = scope.db.scalar(
         scope.select(Document).where(Document.id == document_id)
     )
@@ -181,4 +202,71 @@ def get_document(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "Document not found."},
         )
-    return DocumentOut.model_validate(document)
+    return _build_card(scope, document)
+
+
+def _build_card(scope: AccountScope, document: Document) -> DocumentCardOut:
+    """Assemble a `DocumentCardOut` from the extracted card tables (scoped)."""
+    classes = scope.db.execute(
+        scope.select(DocumentClass)
+        .where(DocumentClass.document_id == document.id)
+        .join(Class, Class.id == DocumentClass.class_id)
+        .with_only_columns(Class.slug, Class.name, DocumentClass.confidence)
+        .order_by(DocumentClass.confidence.desc().nullslast())
+    ).all()
+
+    entity_rows = scope.db.execute(
+        scope.select(DocumentEntity)
+        .where(DocumentEntity.document_id == document.id)
+        .join(Entity, Entity.id == DocumentEntity.entity_id)
+        .with_only_columns(Entity.type, Entity.name)
+    ).all()
+    entities = EntitiesCardOut()
+    _entity_bucket = {
+        "person": entities.people,
+        "organization": entities.organizations,
+        "place": entities.places,
+    }
+    for type_, name in entity_rows:
+        _entity_bucket[type_].append(name)
+
+    dates = scope.db.scalars(
+        scope.select(DocumentDate)
+        .where(DocumentDate.document_id == document.id)
+        .order_by(DocumentDate.value.asc().nullslast())
+    ).all()
+
+    typed_facts = scope.db.scalars(
+        scope.select(TypedFact)
+        .where(TypedFact.document_id == document.id)
+        .order_by(TypedFact.label.asc())
+    ).all()
+
+    fact_count = scope.db.scalar(
+        scope.select(DocumentFact)
+        .where(DocumentFact.document_id == document.id)
+        .with_only_columns(func.count())
+    ) or 0
+
+    card = DocumentCardOut.model_validate(document)
+    card.classes = [
+        ClassCardOut(slug=slug, name=name, confidence=confidence)
+        for slug, name, confidence in classes
+    ]
+    card.entities = entities
+    card.dates = [
+        DateCardOut(value=d.value, raw_text=d.raw_text, role=d.role) for d in dates
+    ]
+    card.typed_facts = [
+        TypedFactCardOut(
+            label=f.label,
+            value=f.value,
+            value_numeric=float(f.value_numeric) if f.value_numeric is not None else None,
+            type=f.value_type,
+            unit=f.unit,
+            page=f.page,
+        )
+        for f in typed_facts
+    ]
+    card.fact_count = fact_count
+    return card

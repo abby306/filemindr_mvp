@@ -7,13 +7,14 @@ background OCR task runs entirely locally (no Vision/network calls).
 from __future__ import annotations
 
 import io
+import json
 
 import fitz
 import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services import ocr, storage
+from app.services import extraction, ocr, storage
 
 
 @pytest.fixture
@@ -23,9 +24,17 @@ def client() -> TestClient:
 
 @pytest.fixture(autouse=True)
 def tmp_storage(monkeypatch, tmp_path):
-    """Point both storage and the OCR cache at a throwaway directory."""
+    """Point storage + OCR cache at a throwaway dir and stub the extraction LLM.
+
+    OCR now chains into extraction; stubbing the model call keeps the upload path
+    offline and deterministic (no DeepSeek network call from the background task).
+    """
     monkeypatch.setattr(storage, "get_storage_root", lambda: tmp_path)
     monkeypatch.setattr(ocr, "get_storage_root", lambda: tmp_path)
+    canned = {"summary": "stub", "classes": [], "atomic_facts": []}
+    monkeypatch.setattr(
+        extraction, "call_extraction_model", lambda text, classes: (json.dumps(canned), "stub")
+    )
 
 
 def _text_pdf_bytes(body: str = "Invoice total 1240 USD due 2025-04-01. Acme Inc.") -> bytes:
@@ -52,7 +61,7 @@ def _upload(client, headers, content: bytes, name: str = "doc.pdf", mime: str = 
     )
 
 
-def test_upload_creates_received_then_ocr_done(client, seeded_account) -> None:
+def test_upload_runs_ocr_then_extraction(client, seeded_account) -> None:
     headers = _auth(seeded_account)
     res = _upload(client, headers, _text_pdf_bytes())
     assert res.status_code == 201
@@ -60,12 +69,14 @@ def test_upload_creates_received_then_ocr_done(client, seeded_account) -> None:
     assert body["status"] == "received"
     doc_id = body["id"]
 
-    # Background OCR has run by the time the request completes.
+    # Background OCR + chained extraction have run by the time the request returns.
     detail = client.get(f"/api/v1/documents/{doc_id}", headers=headers).json()
-    assert detail["status"] == "ocr_done"
+    # OCR persisted its results...
     assert detail["page_count"] == 1
-    # A language is detected; the exact code is unreliable on tiny synthetic text.
-    assert detail["language"] is not None
+    assert detail["language"] is not None  # exact code is unreliable on tiny text
+    # ...and the pipeline advanced past ocr_done into extraction. The stub returns
+    # no classes, so the document lands in needs_review.
+    assert detail["status"] == "needs_review"
 
 
 def test_dedup_returns_existing_document(client, seeded_account) -> None:
