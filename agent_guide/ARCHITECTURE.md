@@ -48,7 +48,7 @@ chat query → intent router → [metadata SQL | FTS | vector ×2-stage] → rer
 - Token counts on both logs → cost-per-document and cost-per-query for free.
 
 ## Models (runtime)
-- OCR: Google Vision. Extraction: GPT-4o-mini / DeepSeek (cheap). Synthesis: GPT-4o (+hard cases). Embeddings: local `bge-small-en-v1.5` (384-d). See `TECH_SPEC.md`.
+- OCR: Google Vision. Extraction: GPT-4o-mini / DeepSeek (cheap). Synthesis: GPT-4o (+hard cases). Embeddings: local `bge-base-en-v1.5` (768-d). See `TECH_SPEC.md`.
 
 ## Deploy
 Native services now → Docker (same compose) at MVP → Contabo VPS. Identical roles/ports across the move.

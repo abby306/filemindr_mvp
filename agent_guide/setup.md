@@ -24,7 +24,7 @@ Describes the **current** machine and environment. Read before running commands 
 | RAM | 8 GB (constraint — see Notes) |
 | Disk | 256 GB SSD |
 | User@host | `softverx@softverx-ThinkPad-T480s` |
-| Project root | `~/dev/filemindr` |
+| Project root | `~/projects/Filemindr` |
 
 ---
 
@@ -51,8 +51,8 @@ Everything runs natively as `systemd` services. **Do not** start Docker or assum
 ## Python
 
 - Managed by **pyenv**, version **3.12.x**, pinned via `.python-version` in the project root.
-- Virtualenv at `~/dev/filemindr/.venv` (stdlib `venv` + `pip`).
-- Activate: `source ~/dev/filemindr/.venv/bin/activate`
+- Virtualenv at `~/projects/Filemindr/.venv` (stdlib `venv` + `pip`).
+- Activate: `source ~/projects/Filemindr/.venv/bin/activate`
 
 ### Installed libraries (core)
 `fastapi`, `uvicorn[standard]`, `sqlalchemy`, `psycopg[binary]`, `pgvector`,
@@ -138,7 +138,7 @@ psql "postgresql://filemindr:localdev@localhost:5432/filemindr" -c "SELECT extve
 # Redis
 redis-cli ping
 # Python stack
-source ~/dev/filemindr/.venv/bin/activate
+source ~/projects/Filemindr/.venv/bin/activate
 python -c "import fastapi, sqlalchemy, pgvector, fitz, openai; print('stack ok')"
 ```
 
