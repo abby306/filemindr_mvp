@@ -1,0 +1,62 @@
+# Seed gold query set for retrieval eval (illustrative).
+#
+# These span the four query intents and are written against the sample documents
+# used during Phase 3/4 validation. `expected_doc_ids` are slugs (placeholders):
+# Phase 5 maps them to real document UUIDs in a seeded eval corpus. The substring
+# and answer expectations are real content from those documents.
+
+- id: sm_total_spend
+  query: "How much did I spend at SM Supermarket?"
+  type: aggregate
+  expected_doc_ids: ["sm-supermarket-receipt"]
+  expected_fact_substrings: ["total amount is PHP 189.00"]
+  answer_contains: ["189"]
+
+- id: sm_vat_amount
+  query: "What was the VAT on the SM Supermarket receipt?"
+  type: aggregate
+  expected_doc_ids: ["sm-supermarket-receipt"]
+  expected_fact_substrings: ["VAT (12%) amount is PHP 20.25"]
+  answer_contains: ["20.25"]
+
+- id: mercury_invoice_number
+  query: "What is the invoice number on the Mercury Drug receipt?"
+  type: lexical
+  expected_doc_ids: ["mercury-drug-receipt"]
+  expected_fact_substrings: ["invoice number is 104044328167"]
+  answer_contains: ["104044328167"]
+
+- id: supervalue_issuer
+  query: "Which document is issued by SUPERVALUE, INC.?"
+  type: lexical
+  expected_doc_ids: ["sm-supermarket-receipt"]
+  expected_fact_substrings: ["SUPERVALUE, INC."]
+  answer_contains: ["SM Supermarket"]
+
+- id: nda_parties
+  query: "Who are the parties to the Viridian NDA?"
+  type: metadata
+  expected_doc_ids: ["viridian-nda"]
+  expected_fact_substrings: ["Viridian Energy Management"]
+  answer_contains: ["Viridian Energy Management", "Abdullah Asad"]
+
+- id: nda_term
+  query: "How long does the Viridian NDA stay in effect?"
+  type: metadata
+  expected_doc_ids: ["viridian-nda"]
+  expected_fact_substrings: ["five years from the Effective Date"]
+  answer_contains: ["five years"]
+
+- id: moodump_stack
+  query: "What technology stack does moodump use?"
+  type: semantic
+  expected_doc_ids: ["moodump-plan"]
+  expected_fact_substrings: ["FastAPI", "pgvector"]
+  answer_contains: ["FastAPI"]
+
+- id: moodump_price
+  query: "What is the moodump subscription price?"
+  type: semantic
+  expected_doc_ids: ["moodump-plan"]
+  expected_fact_substrings: ["subscription price is $20/month"]
+  answer_contains: ["$20"]
