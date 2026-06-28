@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     # Max parallel network calls per document (per-chunk extraction, per-page OCR).
     max_parallel_calls: int = 4
 
+    # Reject uploads larger than this (megabytes) before they fill memory/disk.
+    max_upload_mb: int = 50
+
     # Local filesystem + runtime
     storage_dir: str = "./storage"
     app_env: str = "development"

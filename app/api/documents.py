@@ -13,6 +13,7 @@ import binascii
 import datetime as dt
 import json
 import uuid
+from pathlib import Path
 
 from fastapi import (
     APIRouter,
@@ -26,6 +27,7 @@ from fastapi import (
     status,
 )
 from sqlalchemy import func, tuple_
+from starlette.concurrency import run_in_threadpool
 
 from app.api.schemas import (
     ClassCardOut,
@@ -36,6 +38,7 @@ from app.api.schemas import (
     EntitiesCardOut,
     TypedFactCardOut,
 )
+from app.core.config import get_settings
 from app.core.scoping import AccountScope, get_current_account
 from app.db.models import (
     Class,
@@ -49,7 +52,7 @@ from app.db.models import (
 )
 from app.services import ocr
 from app.services.events import record_event
-from app.services.storage import save_upload
+from app.services.storage import FileTooLargeError, save_stream
 
 router = APIRouter(prefix="/api/v1", tags=["documents"])
 
@@ -107,15 +110,29 @@ async def upload_document(
             },
         )
 
-    content = await file.read()
-    if not content:
+    ext = ocr.extension_for(mime_type, file.filename)
+    settings = get_settings()
+    max_bytes = settings.max_upload_mb * 1024 * 1024
+    file.file.seek(0)
+    try:
+        stored = await run_in_threadpool(
+            save_stream, file.file, scope.account_id, ext, max_bytes=max_bytes
+        )
+    except FileTooLargeError:
+        raise HTTPException(
+            status_code=413,  # Content Too Large
+            detail={
+                "code": "file_too_large",
+                "message": f"File exceeds the {settings.max_upload_mb} MB limit.",
+            },
+        )
+
+    if stored.byte_size == 0:
+        Path(stored.storage_path).unlink(missing_ok=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "empty_file", "message": "Uploaded file is empty."},
         )
-
-    ext = ocr.extension_for(mime_type, file.filename)
-    stored = save_upload(content, scope.account_id, ext)
 
     # Dedup: identical (account, file_hash) returns the existing document.
     existing = scope.db.scalar(

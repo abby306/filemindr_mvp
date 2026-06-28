@@ -112,6 +112,15 @@ def test_empty_file_rejected(client, seeded_account) -> None:
     assert res.json()["detail"]["code"] == "empty_file"
 
 
+def test_oversized_upload_rejected(client, seeded_account, monkeypatch) -> None:
+    from app.core.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "max_upload_mb", 0)  # cap below any real file
+    res = _upload(client, _auth(seeded_account), _text_pdf_bytes())
+    assert res.status_code == 413
+    assert res.json()["detail"]["code"] == "file_too_large"
+
+
 def test_upload_requires_auth(client) -> None:
     res = _upload(client, {}, _text_pdf_bytes())
     assert res.status_code == 401

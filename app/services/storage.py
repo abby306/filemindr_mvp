@@ -5,6 +5,11 @@ the on-disk name, laid out as ``<storage_root>/<account_id>/<hash><ext>``. Write
 are atomic (temp file then ``os.replace``) so a crashed upload never leaves a
 half-written file that looks complete.
 
+Uploads are **streamed**: bytes are read in chunks, hashed incrementally, and
+written straight to the temp file, so a large file never sits whole in memory.
+A size cap is enforced mid-stream so an oversized upload is rejected before it
+fills the disk.
+
 `get_storage_root` is the single point that resolves the storage directory, so
 tests can redirect it without touching settings.
 """
@@ -16,8 +21,26 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 from app.core.config import get_settings
+
+# Chunk size for streaming reads/writes (1 MiB).
+_STREAM_CHUNK = 1024 * 1024
+
+
+class Readable(Protocol):
+    """A synchronous, chunk-readable byte stream (e.g. a spooled temp file)."""
+
+    def read(self, size: int = ..., /) -> bytes: ...
+
+
+class FileTooLargeError(Exception):
+    """Raised when a streamed upload exceeds the configured byte limit."""
+
+    def __init__(self, limit_bytes: int) -> None:
+        self.limit_bytes = limit_bytes
+        super().__init__(f"Upload exceeds the {limit_bytes}-byte limit.")
 
 
 @dataclass(frozen=True)
@@ -37,31 +60,46 @@ def compute_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
-def save_upload(
-    content: bytes,
+def save_stream(
+    stream: Readable,
     account_id: uuid.UUID,
     ext: str,
     *,
+    max_bytes: int,
     storage_root: Path | None = None,
 ) -> StoredFile:
-    """Persist `content` for `account_id` and return its address.
+    """Stream `stream` to content-addressed storage for `account_id`.
 
-    Idempotent by construction: the same bytes map to the same path, so a repeat
-    upload simply overwrites with identical content. `ext` should include the
-    leading dot (e.g. ``.pdf``); it is only cosmetic for the filename.
+    Reads in chunks (never buffering the whole body), hashing as it goes, and
+    rejects the upload with `FileTooLargeError` the moment it exceeds
+    `max_bytes`. On success the temp file is atomically renamed to its
+    ``<hash><ext>`` path; on any failure the temp file is removed. Idempotent by
+    construction: identical bytes map to the same path. `ext` includes the
+    leading dot and is cosmetic only.
     """
     root = storage_root or get_storage_root()
-    file_hash = compute_hash(content)
     account_dir = root / str(account_id)
     account_dir.mkdir(parents=True, exist_ok=True)
 
-    final_path = account_dir / f"{file_hash}{ext}"
-    tmp_path = account_dir / f".{file_hash}{ext}.{uuid.uuid4().hex}.tmp"
-    tmp_path.write_bytes(content)
-    os.replace(tmp_path, final_path)
+    digest = hashlib.sha256()
+    size = 0
+    tmp_path = account_dir / f".upload.{uuid.uuid4().hex}{ext}.tmp"
+    try:
+        with tmp_path.open("wb") as tmp:
+            while True:
+                chunk = stream.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise FileTooLargeError(max_bytes)
+                digest.update(chunk)
+                tmp.write(chunk)
+        file_hash = digest.hexdigest()
+        final_path = account_dir / f"{file_hash}{ext}"
+        os.replace(tmp_path, final_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
-    return StoredFile(
-        file_hash=file_hash,
-        storage_path=str(final_path),
-        byte_size=len(content),
-    )
+    return StoredFile(file_hash=file_hash, storage_path=str(final_path), byte_size=size)
