@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.core.concurrency import map_bounded
 from app.core.config import get_settings
 from app.core.retry import with_retry
 from app.db.models import (
@@ -622,33 +623,49 @@ def run_extraction(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
                 chunks = [PageChunk(1, document.page_count or 1, document.ocr_text)]
 
             settings = get_settings()
-            raw_chunks: list[dict] = []
-            results: list[ExtractionResult] = []
-            failed_chunks: list[dict] = []
-            model_name = ""
-            for index, chunk in enumerate(chunks):
+
+            def _extract_chunk(item: tuple[int, PageChunk]) -> dict:
+                """Network + parse for one chunk (runs in a worker thread; no DB)."""
+                index, chunk = item
                 try:
-                    raw, model_name = with_retry(
+                    raw, model = with_retry(
                         partial(call_extraction_model, chunk.text, catalog),
                         attempts=settings.retry_max_attempts,
                         base_delay=settings.retry_base_delay,
                         is_retryable=_is_transient_llm,
                     )
-                    parsed = parse_extraction(raw)
+                    return {"raw": raw, "model": model, "parsed": parse_extraction(raw)}
                 except Exception as exc:  # noqa: BLE001 — tolerate a bad chunk, record it
-                    failed_chunks.append(
-                        {
+                    return {
+                        "failed": {
                             "chunk": index,
                             "pages": [chunk.start_page, chunk.end_page],
                             "error": str(exc),
                         }
-                    )
+                    }
+
+            # Parallelize only the network phase; results stay in chunk order so
+            # the merge's title/summary still come from the earliest chunk.
+            outcomes = map_bounded(
+                _extract_chunk,
+                list(enumerate(chunks)),
+                max_workers=settings.max_parallel_calls,
+            )
+
+            raw_chunks: list[dict] = []
+            results: list[ExtractionResult] = []
+            failed_chunks: list[dict] = []
+            model_name = ""
+            for outcome in outcomes:
+                if "failed" in outcome:
+                    failed_chunks.append(outcome["failed"])
                     continue
-                results.append(parsed)
+                results.append(outcome["parsed"])
+                model_name = outcome["model"]
                 try:
-                    raw_chunks.append(json.loads(raw))
+                    raw_chunks.append(json.loads(outcome["raw"]))
                 except json.JSONDecodeError:
-                    raw_chunks.append({"raw": raw})
+                    raw_chunks.append({"raw": outcome["raw"]})
 
             # Partial tolerance: a doc fails only if *every* chunk failed; one or
             # more good chunks still produce a (partial) card.

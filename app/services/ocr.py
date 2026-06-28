@@ -24,6 +24,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from langdetect import DetectorFactory, LangDetectException, detect
 
+from app.core.concurrency import map_bounded
 from app.core.config import get_settings
 from app.core.retry import with_retry
 from app.db.models import Document
@@ -262,21 +263,37 @@ def ocr_pdf_via_vision(path: str | Path) -> OcrResult:
     `failed_pages` and left with empty text rather than failing the whole
     document; only an all-pages failure raises.
     """
-    pages: list[OcrPage] = []
-    languages: list[str] = []
-    failed_pages: list[int] = []
+    # Rasterize serially — PyMuPDF is not thread-safe on a shared document — then
+    # OCR the page images in parallel (the network phase).
     zoom = _RASTER_DPI / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(path) as doc:
         page_count = doc.page_count
-        for index, page in enumerate(doc, start=1):
-            content = page.get_pixmap(matrix=matrix).tobytes("png")
-            try:
-                text, blocks, langs = _vision_ocr_with_retry(content)
-            except Exception:  # noqa: BLE001 — tolerate a bad page, record it
-                failed_pages.append(index)
-                pages.append(OcrPage(page=index, text="", blocks=[]))
-                continue
+        rasters = [
+            (index, page.get_pixmap(matrix=matrix).tobytes("png"))
+            for index, page in enumerate(doc, start=1)
+        ]
+
+    def _ocr_page(item: tuple[int, bytes]) -> tuple[int, str | None, list[OcrBlock], list[str]]:
+        index, content = item
+        try:
+            text, blocks, langs = _vision_ocr_with_retry(content)
+        except Exception:  # noqa: BLE001 — tolerate a bad page, record it
+            return index, None, [], []
+        return index, text, blocks, langs
+
+    outcomes = map_bounded(
+        _ocr_page, rasters, max_workers=get_settings().max_parallel_calls
+    )
+
+    pages: list[OcrPage] = []
+    languages: list[str] = []
+    failed_pages: list[int] = []
+    for index, text, blocks, langs in outcomes:  # input (page) order preserved
+        if text is None:
+            failed_pages.append(index)
+            pages.append(OcrPage(page=index, text="", blocks=[]))
+        else:
             languages.extend(langs)
             pages.append(OcrPage(page=index, text=text, blocks=blocks))
 

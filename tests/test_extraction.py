@@ -366,6 +366,34 @@ def test_run_extraction_covers_all_pages_via_chunks(seeded_account, monkeypatch)
         assert {f.page for f in facts} == {1, 2, 3}  # every page covered
 
 
+def test_run_extraction_merges_in_chunk_order(seeded_account, monkeypatch) -> None:
+    # Even when chunks are extracted in parallel, the merged title/summary must
+    # come from the earliest chunk (results stay in chunk order).
+    account_id = seeded_account["personal_id"]
+    monkeypatch.setattr(extraction, "_CHUNK_CHAR_BUDGET", 50)
+    page_texts = [f"Page {i} body " + "filler " * 20 for i in range(1, 4)]
+    doc_id = _make_document(account_id, page_texts=page_texts)
+
+    def per_page(text, classes):
+        page = int(re.search(r"PAGE (\d+)", text).group(1))
+        payload = {
+            "title": f"Title from page {page}",
+            "summary": f"Summary from page {page}",
+            "classes": [{"slug": "invoice", "confidence": 0.9}],
+            "atomic_facts": [{"text": f"Fact on page {page}", "page": page}],
+        }
+        return json.dumps(payload), "m"
+
+    monkeypatch.setattr(extraction, "call_extraction_model", per_page)
+
+    extraction.run_extraction(doc_id, account_id)
+
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        assert document.title == "Title from page 1"  # earliest chunk wins
+        assert document.summary == "Summary from page 1"
+
+
 def test_run_extraction_tolerates_a_failed_chunk(seeded_account, monkeypatch) -> None:
     account_id = seeded_account["personal_id"]
     monkeypatch.setattr(extraction, "_CHUNK_CHAR_BUDGET", 50)

@@ -94,6 +94,9 @@ def _blank_pdf(path, pages: int) -> None:
 def test_pdf_vision_skips_a_failed_page(monkeypatch, tmp_path) -> None:
     pdf = tmp_path / "scan.pdf"
     _blank_pdf(pdf, 3)
+    # Pin concurrency to 1 so call order == page order, making "page 2 fails"
+    # deterministic; the concurrency cap itself is covered in test_concurrency.py.
+    monkeypatch.setattr(ocr.get_settings(), "max_parallel_calls", 1)
     calls = {"n": 0}
 
     def stub(content):

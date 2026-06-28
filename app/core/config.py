@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     retry_max_attempts: int = 3
     retry_base_delay: float = 0.5
 
+    # Max parallel network calls per document (per-chunk extraction, per-page OCR).
+    max_parallel_calls: int = 4
+
     # Local filesystem + runtime
     storage_dir: str = "./storage"
     app_env: str = "development"
