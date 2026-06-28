@@ -130,3 +130,21 @@ def test_failed_pages_round_trips_through_cache() -> None:
         pages=[ocr.OcrPage(page=1, text="x")], failed_pages=[2],
     )
     assert ocr.OcrResult.from_cache(result.to_cache()).failed_pages == [2]
+
+
+# --- native-PDF block bboxes (text-layer path; no network) ------------------
+def test_text_layer_pdf_emits_block_bboxes(tmp_path) -> None:
+    pdf = tmp_path / "text.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "Invoice total 1240 USD due 2025-04-01. " + ("filler " * 10))
+    doc.save(pdf)
+    doc.close()
+
+    result = ocr.ocr_document(ocr.PDF_MIME, str(pdf))
+
+    assert result.engine == ocr.ENGINE_PDF_TEXT
+    assert result.pages[0].blocks  # native PDF now carries blocks
+    bbox = result.pages[0].blocks[0].bbox
+    assert len(bbox) == 4 and all(len(v) == 2 for v in bbox)  # 4 (x, y) vertices
+    assert "Invoice total 1240" in result.pages[0].blocks[0].text

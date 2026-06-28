@@ -169,6 +169,26 @@ def test_parse_extraction_strips_code_fences() -> None:
     assert extraction.parse_extraction(fenced).title == "T"
 
 
+def test_bbox_for_fact_matches_native_pdf_blocks() -> None:
+    # A text-layer PDF now carries block bboxes (4-vertex polygons); the matcher
+    # attaches one to a fact that overlaps a block, and nothing to an unrelated one.
+    box = [[0, 0], [100, 0], [100, 20], [0, 20]]
+    cached = ocr.OcrResult(
+        engine=ocr.ENGINE_PDF_TEXT, page_count=1, language="en",
+        text="Invoice total 1240 USD due 2025-04-01.",
+        pages=[
+            ocr.OcrPage(
+                page=1,
+                text="Invoice total 1240 USD due 2025-04-01.",
+                blocks=[ocr.OcrBlock(text="Invoice total 1240 USD due 2025-04-01.", bbox=box)],
+            )
+        ],
+    )
+    hit = extraction._bbox_for_fact(cached, 1, "The invoice total is 1240 USD.")
+    assert hit == {"page": 1, "bbox": box}
+    assert extraction._bbox_for_fact(cached, 1, "completely unrelated content here") is None
+
+
 # --- fan-out (live DB) -----------------------------------------------------
 def test_run_extraction_writes_card(seeded_account, canned_model) -> None:
     account_id = seeded_account["personal_id"]

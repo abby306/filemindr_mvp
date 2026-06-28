@@ -149,6 +149,39 @@ def probe_pdf_text_layer(path: str | Path) -> tuple[list[str], int, bool]:
     return page_texts, page_count, has_layer
 
 
+# --- PDF text-layer pages (with block bboxes) ------------------------------
+def _pdf_text_blocks(page) -> list[OcrBlock]:
+    """Block-level text + bbox for one PDF page (PyMuPDF `get_text("blocks")`).
+
+    Each block's rectangle is emitted as a 4-vertex polygon, matching the shape
+    the Vision path produces, so `extraction._bbox_for_fact` works unchanged for
+    native PDFs and scanned ones alike.
+    """
+    blocks: list[OcrBlock] = []
+    for x0, y0, x1, y1, text, *_ in page.get_text("blocks"):
+        clean = text.strip()
+        if not clean:  # skip empty / image blocks
+            continue
+        bbox = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+        blocks.append(OcrBlock(text=clean, bbox=bbox))
+    return blocks
+
+
+def _pdf_text_layer_pages(path: str | Path) -> list[OcrPage]:
+    """Per-page text + block bboxes for a PDF read directly from its text layer."""
+    pages: list[OcrPage] = []
+    with fitz.open(path) as doc:
+        for index, page in enumerate(doc, start=1):
+            pages.append(
+                OcrPage(
+                    page=index,
+                    text=page.get_text("text"),
+                    blocks=_pdf_text_blocks(page),
+                )
+            )
+    return pages
+
+
 # --- docx ------------------------------------------------------------------
 def extract_docx(path: str | Path) -> str:
     """Read visible paragraph text from a .docx file."""
@@ -337,13 +370,14 @@ def ocr_document(mime_type: str, storage_path: str) -> OcrResult:
         page_texts, page_count, has_layer = probe_pdf_text_layer(storage_path)
         engine = choose_engine(mime_type, has_layer)
         if engine == ENGINE_PDF_TEXT:
-            full_text = "\n\n".join(page_texts).strip()
+            pages = _pdf_text_layer_pages(storage_path)
+            full_text = "\n\n".join(p.text for p in pages).strip()
             return OcrResult(
                 engine=ENGINE_PDF_TEXT,
                 page_count=page_count,
                 language=detect_language(full_text),
                 text=full_text,
-                pages=[OcrPage(page=i, text=t) for i, t in enumerate(page_texts, start=1)],
+                pages=pages,
             )
         return ocr_pdf_via_vision(storage_path)
 
