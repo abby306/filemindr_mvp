@@ -14,7 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services import extraction, ocr, storage
+from app.services import embeddings, extraction, ocr, storage
 
 
 @pytest.fixture
@@ -34,6 +34,12 @@ def tmp_storage(monkeypatch, tmp_path):
     canned = {"summary": "stub", "classes": [], "atomic_facts": []}
     monkeypatch.setattr(
         extraction, "call_extraction_model", lambda text, classes: (json.dumps(canned), "stub")
+    )
+    # Extraction chains into embedding (incl. needs_review); stub the encoder so
+    # the upload path stays offline and fast (no bge model load).
+    monkeypatch.setattr(
+        embeddings, "embed_passages",
+        lambda texts: [[0.0] * embeddings.EMBEDDING_DIM for _ in texts],
     )
 
 

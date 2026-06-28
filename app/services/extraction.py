@@ -641,7 +641,18 @@ def run_extraction(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
                     "atomic_facts": fact_count,
                 },
             )
+            final_status = document.status
             db.commit()
+
+            # Chain embedding for every successfully-extracted doc so it is
+            # retrievable — including `needs_review` (run_embedding keeps that
+            # flag rather than flipping it to `indexed`). Local import avoids a
+            # cycle; run_embedding opens its own session and handles its own
+            # failures, so it never disturbs the committed card.
+            if final_status in ("extracted", "needs_review"):
+                from app.services import embeddings
+
+                embeddings.run_embedding(document_id, account_id)
         except Exception as exc:  # noqa: BLE001 — record any failure, don't crash the worker
             db.rollback()
             document = db.get(Document, document_id)

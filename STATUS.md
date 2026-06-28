@@ -2,7 +2,7 @@
 
 > **Purpose:** a self-contained handoff for the next agent/session. Read this before touching code so you don't have to re-traverse the whole repo. Update it at the end of each development cycle.
 >
-> **Last updated:** 2026-06-28 · after **Phase 3 (extraction)** · branch `main` (commit pending) · prior push at `65686c3` (`github.com/abby306/filemindr_mvp`).
+> **Last updated:** 2026-06-28 · after **Phase 4 (embeddings/index)** · branch `main` (commit pending) · prior push at `dc6e73e` (`github.com/abby306/filemindr_mvp`).
 
 ---
 
@@ -21,14 +21,14 @@ Authoritative design docs live in [`agent_guide/`](agent_guide/): `PRD.md` → `
 | 1 — FastAPI foundations | ✅ Done | config, ORM, session, auth, scoping, `/health`, seed |
 | 2 — Ingest + OCR routing | ✅ Done | upload, dedup, storage, OCR pipeline → `ocr_done` |
 | 3 — Extraction | ✅ Done | DeepSeek card + atomic facts → `extracted`/`needs_review`; card API |
-| 4 — Embeddings/index | ⏭️ **Next** | embed facts+summary → `indexed` |
-| 5 — Retrieval + synthesis | ⏭️ Pending | intent router, hybrid retrieval, grounded answers |
+| 4 — Embeddings/index | ✅ Done | bge-base embeds facts+summary → `indexed`; both HNSW stages indexed |
+| 5 — Retrieval + synthesis | ⏭️ **Next** | intent router, hybrid retrieval, grounded answers |
 | 6 — Frontend (Next.js) | ⏭️ Pending | Upload / Document view / Ask / Ratings |
 | 7 — Analytics + billing | ⏭️ Pending | usage counters, plans, quotas |
 
-- **Tests:** 51 passing (`pytest -q`). Run against the **live local Postgres**.
-- **Document pipeline status flow:** `received → ocr_done → extracted → [indexed]` (+ `failed` / `needs_review`). We currently reach **`extracted`** (or **`needs_review`** when top-class confidence < 0.5); OCR auto-chains into extraction.
-- **DB:** 22 tables + `v_document_pipeline` view applied (schema is done — see §6). Seed present: 1 dev user, personal + company accounts, 14 system classes each, **0 documents**.
+- **Tests:** 61 passing (`pytest -q`). Run against the **live local Postgres**. Offline — Vision, DeepSeek, and the bge encoder are all mocked.
+- **Document pipeline status flow:** `received → ocr_done → extracted → indexed` (+ `failed` / `needs_review`). The full chain auto-runs on upload: OCR → extraction → embedding. **Every successfully-extracted doc is embedded** (so it is retrievable); confident docs reach **`indexed`**, low-confidence ones are embedded but **stay `needs_review`** (searchable + flagged for human review).
+- **DB:** 22 tables + `v_document_pipeline` view; migration `0002` adds the `documents.summary_embedding` HNSW index (both vector stages now indexed — see §6). Seed: 1 dev user, personal + company accounts, 14 system classes each, **0 documents**.
 
 ---
 
@@ -89,7 +89,10 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
   - **`call_extraction_model(text, classes) → (raw_json, model_name)`** — the **only network seam** (DeepSeek via `OpenAI(base_url=…)`, `response_format=json_object`, temp 0). Called once per chunk. Monkeypatched in tests.
   - Fan-out writers (all account-scoped): `_write_card` (classes→`document_classes` matching catalog slugs, **unknown slugs dropped**; entities upserted into `entities` by `(account, type, normalized_name)` then linked via `document_entities`, deduped per doc; dates→`document_dates`; typed facts→`typed_facts`), `_write_atomic_facts` (→`document_facts`, **best-effort bbox** via token-overlap match against OCR-cache blocks on the fact's page; `embedding` stays null until Phase 4).
   - `_route_status` → `extracted` if top-class confidence ≥ `REVIEW_CONFIDENCE` (0.5), else `needs_review` (also `needs_review` when no class predicted).
-  - **`run_extraction(document_id, account_id)`** — background entry point: own session, account-scoped, **idempotent** (clears the prior card before rewriting, so re-runs are clean). Loads the OCR-cache artifact → `chunk_pages` → one `call_extraction_model` per chunk → `merge_results` → fan-out (no cache ⇒ single-chunk fallback over `ocr_text`). Saves `extraction_raw` (`{chunk_count, chunks:[parsed JSON per chunk]}`), `extraction_model`, `title`, `summary`; logs `processing_events(extraction, …)` with the chunk count; on exception sets `failed`. Re-extractable from `ocr_done`/`extracted`/`needs_review`.
+  - **`run_extraction(document_id, account_id)`** — background entry point: own session, account-scoped, **idempotent** (clears the prior card before rewriting, so re-runs are clean). Loads the OCR-cache artifact → `chunk_pages` → one `call_extraction_model` per chunk → `merge_results` → fan-out (no cache ⇒ single-chunk fallback over `ocr_text`). Saves `extraction_raw` (`{chunk_count, chunks:[parsed JSON per chunk]}`), `extraction_model`, `title`, `summary`; logs `processing_events(extraction, …)` with the chunk count; on exception sets `failed`. Re-extractable from `ocr_done`/`extracted`/`needs_review`. **On `extracted` (not `needs_review`), chains `embeddings.run_embedding`** (local import).
+- **`embeddings.py`** — Phase-4 local embeddings (**`BAAI/bge-base-en-v1.5`**, 768-d, CPU; lazy singleton). Key pieces:
+  - **Asymmetric encoding** (bge convention, matters for retrieval accuracy): `embed_passages(texts)` for indexing (no prefix); `embed_query(q)` for Phase-5 search (prepends `QUERY_INSTRUCTION`). Both go through `_encode` (the single compute seam, **`normalize_embeddings=True`** so cosine distance is exact) — tests stub it, never downloading the model.
+  - **`run_embedding(document_id, account_id)`** — background entry point: own session, account-scoped, idempotent (overwrites vectors in place). Embeds all `document_facts.text` → `embedding` and `documents.summary` → `summary_embedding`; status → `indexed`. A `needs_review` doc is still embedded (searchable) but **keeps its review flag** rather than flipping to `indexed`. Logs `processing_events(embedding, …)`; on exception sets `failed`. Re-indexable from `extracted`/`indexed`/`needs_review`.
 
 ### `app/api/` — HTTP layer
 - **`schemas.py`** — Pydantic response models. `DocumentOut` (id, status, source, original_filename, mime_type, byte_size, title, summary, language, page_count, created_at — `from_attributes=True`) is the light list/ingest view. `DocumentListOut` (items + next_cursor). **`DocumentCardOut`** (extends `DocumentOut`) adds `classes` (`ClassCardOut` slug/name/confidence), `entities` (`EntitiesCardOut` people/orgs/places), `dates` (`DateCardOut`), `typed_facts` (`TypedFactCardOut`; `value_type`→`type`), and `fact_count` — returned by the document-detail endpoint.
@@ -112,6 +115,7 @@ Idempotent. `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.co
 - **`test_routes.py`** — `/health`; `/api/v1/me` auth gates (401 no/bad token, 400 multi-account needs header, 200 correct, 403 non-member).
 - **`test_ocr_routing.py`** — `choose_engine` matrix, `probe_pdf_text_layer` (text vs empty PDF, generated with fitz), `extension_for`, `detect_language`. **No network.**
 - **`test_documents.py`** — upload→OCR→**chained extraction** (uses a **text-layer PDF** so OCR is local; `tmp_storage` also **stubs `extraction.call_extraction_model`** so the chained call is offline → doc lands in `needs_review`), dedup (200 + same id), 415 unsupported, 400 empty, 401 unauth, account isolation on detail+list. `tmp_storage` monkeypatches `storage.get_storage_root` **and** `ocr.get_storage_root` to a tmp dir.
+- **`test_embeddings.py`** (10 tests) — passage/query asymmetry (`embed_query` prefixes `QUERY_INSTRUCTION`, `embed_passages` doesn't, empty no-op); live-DB `run_embedding` (facts + summary get 768-vecs, status → `indexed`); no-facts doc (summary only); idempotent re-index; **`needs_review` embedded but flag preserved**; unindexable status no-op; account isolation; **extraction→embedding chain** reaches `indexed`. Encoder stubbed via `embed_passages`/`_encode` → no model download.
 - **`test_extraction.py`** (14 tests) — `parse_extraction` (valid, lenient enums/dates, numeric coercion + confidence clamp, code-fence stripping); **`chunk_pages`** (single-chunk when small; contiguous split without splitting a page); **`merge_results`** (union + dedup of classes/entities/dates/facts, single-result passthrough); live-DB fan-out (tables written, unknown slug dropped, org deduped, `extraction_raw`/`title`/`summary` set); **idempotent re-run**; **`needs_review` routing**; **account isolation** (wrong-account run is a no-op); **multi-chunk run** (3-page cache + tiny budget ⇒ 3 LLM calls, facts cover all pages); card endpoint returns the assembled `DocumentCardOut`. LLM mocked via `call_extraction_model` → fully offline.
 
 ---
@@ -124,7 +128,8 @@ Idempotent. `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.co
 3. **Dedup**: if `(account_id, file_hash)` exists → return it (200). Else insert `documents` row at `received`, log `processing_events(received, succeeded)`, commit (201).
 4. `BackgroundTask` → `run_ocr(document_id, account_id)`: check OCR cache by hash → else route (PDF text-layer probe → Vision fallback / docx / image→Vision) → write `ocr_text`, `ocr_engine`, `page_count`, `language`; status → `ocr_done`; log `processing_events(ocr, succeeded)`. Vision block bboxes + full per-page artifact saved to `storage/ocr_cache/<hash>.json` for later provenance.
 5. **Chained** → `run_extraction(document_id, account_id)`: DeepSeek structured pass(es) over the OCR text — **page-window chunked** for long docs (one call per ~14k-char chunk, results merged) → card + atomic facts fanned into `document_classes`/`entities`/`document_entities`/`document_dates`/`typed_facts`/`document_facts`; `extraction_raw`/`extraction_model`/`title`/`summary` written; status → `extracted` (or `needs_review`); log `processing_events(extraction, succeeded)`.
-6. `GET /api/v1/documents` (light list) / `GET /api/v1/documents/{id}` (full card) to read back (account-scoped).
+6. **Chained on `extracted`** → `run_embedding(document_id, account_id)`: bge-base embeds every `document_facts.text` → `embedding` and `summary` → `summary_embedding`; status → `indexed`; log `processing_events(embedding, succeeded)`.
+7. `GET /api/v1/documents` (light list) / `GET /api/v1/documents/{id}` (full card) to read back (account-scoped).
 
 **Chat (Flow B):** not built yet (Phase 5).
 
@@ -132,7 +137,7 @@ Idempotent. `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.co
 
 ## 6. Schema (already applied — do not recreate)
 
-`schema.sql` / `alembic/versions/0001_initial_schema.py` define **21 tables + `v_document_pipeline` view** at `vector(768)` (for `bge-base-en-v1.5`). Embeddings model is locked at **768-dim**. `alembic upgrade head` is the apply path; **all schema changes go through new Alembic migrations** (additive; ask before destructive ops). `plans` table is seeded (`free`/`pro`/`team`) by the migration. Tables: identity/tenancy (`accounts`, `users`, `account_members`, `classes`), documents/card (`documents`, `document_classes`, `entities`, `document_entities`, `document_dates`, `typed_facts`), retrieval (`document_facts` — HNSW cosine + GIN fts), chat/observability (`conversations`, `messages`, `retrieval_traces`, `processing_events`), feedback/billing (`answer_ratings`, `usage_events`, `plans`, `subscriptions`, `invoices`, `usage_counters`).
+`schema.sql` / `alembic/versions/0001_initial_schema.py` define **21 tables + `v_document_pipeline` view** at `vector(768)` (for `bge-base-en-v1.5`). Embeddings model is locked at **768-dim**. Migration **`0002`** adds the `documents.summary_embedding` HNSW cosine index (`m=16, ef_construction=64`), matching the one on `document_facts.embedding` — so **both vector-retrieval stages are indexed** (`summary_embedding` to pick docs → `document_facts.embedding` to rank facts). `alembic upgrade head` is the apply path; **all schema changes go through new Alembic migrations** (additive; ask before destructive ops). `plans` table is seeded (`free`/`pro`/`team`) by the migration. Tables: identity/tenancy (`accounts`, `users`, `account_members`, `classes`), documents/card (`documents`, `document_classes`, `entities`, `document_entities`, `document_dates`, `typed_facts`), retrieval (`document_facts` — HNSW cosine + GIN fts), chat/observability (`conversations`, `messages`, `retrieval_traces`, `processing_events`), feedback/billing (`answer_ratings`, `usage_events`, `plans`, `subscriptions`, `invoices`, `usage_counters`).
 
 ---
 
@@ -144,23 +149,23 @@ Idempotent. `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.co
 | Extraction (cheap structured pass) | **DeepSeek** `deepseek-chat` (OpenAI-compatible client, custom `base_url`) | `DEEPSEEK_API_KEY` | ✅ live (Phase 3) |
 | Intent routing + standard synthesis | **Gemini 2.5 Flash** | `GEMINI_API_KEY` | key set, not wired |
 | Hard synthesis / low-confidence re-check | **GPT-4o** | `OPENAI_API_KEY` | key set, not wired |
-| Embeddings | `bge-base-en-v1.5` (local, 768-d, CPU) | — | **`sentence-transformers` NOT yet installed** (Phase 4) |
+| Embeddings | `bge-base-en-v1.5` (local, 768-d, CPU) | — | ✅ live (Phase 4); `sentence-transformers`/`torch` installed |
 
 Cost discipline: cheap model for extraction, strong only for hard synthesis, local embeddings.
 
 ---
 
-## 8. Next steps — Phase 4 (Embeddings / index)
+## 8. Next steps — Phase 5 (Retrieval + synthesis)
 
-Goal: take a doc at `extracted` → embed its facts + summary → `indexed`.
-1. **Install** `sentence-transformers` + `bge-base-en-v1.5` (local, 768-d, CPU). Pin in requirements; first load downloads weights (~400 MB) — mind the 8 GB box.
-2. **`app/services/embeddings.py`** — load the model once (singleton, like `_vision_client`); `embed_texts(list[str]) → list[vec768]`. Keep it the only seam so tests can stub it (no model download in CI).
-3. **Embed + write** — for each `document_facts` row of a doc, set `embedding`; set `documents.summary_embedding` from the summary. Batch the encode. Run **chained after extraction** (or as a follow-on), mirroring the OCR→extraction handoff; status → `indexed`; log `processing_events(embedding/indexing, …)`.
-4. **Re-index path** — re-embedding must be idempotent (overwrite, not append). The HNSW index + GIN fts already exist (Phase 0 schema), so this is writes only.
-5. Tests: embedding fan-out (rows get a 768-vec), idempotent re-run, account scoping, status → `indexed`. **Stub the encoder** so the suite stays offline/deterministic.
-6. Decide the extraction→embedding trigger: extend the OCR-chained flow (`run_ocr → run_extraction → run_embedding`) vs. a dedicated follow-on task. The chain is simplest in the single-process `BackgroundTasks` model; revisit when the Redis worker lands.
-
-Then **Phase 5** (retrieval + synthesis): intent router, hybrid retrieval over the now-indexed facts, grounded answers with citations. Map the remaining ORM tables (`conversations`, `messages`, `retrieval_traces`, …) as that phase needs them.
+Goal: answer a user query by retrieving against the now-indexed structured data, with citations. Per `TECH_SPEC.md` §Retrieval:
+1. **Intent router** (cheap model / rules) → `metadata | semantic | hybrid | aggregate`. New `app/services/retrieval.py`.
+2. **Structured-first** (no LLM): aggregate/metadata queries hit `typed_facts` (`value_numeric` for sums/compares), `document_dates`, `entities`, `document_classes` directly. *This is where "how much did I spend" belongs — not vector search* (the bge smoke confirmed vague amount queries mis-rank against item names).
+3. **Lexical**: Postgres FTS over `document_facts.fts` (GIN, already generated) for exact ids/names.
+4. **Vector, two-stage**: `embed_query(q)` → `documents.summary_embedding` (HNSW) picks candidate docs → `document_facts.embedding` (HNSW) ranks facts within them. Use `embed_query` (instruction-prefixed), **not** `embed_passages`.
+5. **Rerank** merged candidates (cross-encoder, e.g. bge-reranker) → top facts.
+6. **Synthesize** (Gemini 2.5 Flash standard / GPT-4o hard) over top facts + metadata → answer with **mandatory citations** (each fact already carries `document_id`/`page`/`bbox`).
+7. **Persist + stream**: map `conversations`/`messages`/`retrieval_traces` ORM tables; write a trace per answer; emit the pipeline stages as SSE events (intent → shortlist → reading → tokens → citations) — the foundation for the real-time "subprocess" UX and shortlist-confirmation/guided-narrowing.
+8. Wire `gemini_api_key` (field exists) into a Gemini client; add a model-routing seam (cheap vs. hard synthesis). Mock all LLM/encoder seams in tests.
 
 ---
 
@@ -169,7 +174,8 @@ Then **Phase 5** (retrieval + synthesis): intent router, hybrid retrieval over t
 - **`CODING_STANDARDS.md` missing** — referenced by `AGENTS.md`/`claude.md` but not on disk. Follow conventions visible in code (PEP 8, `from __future__ import annotations`, typed, docstrings, `pathlib`).
 - **Error envelope inconsistency** — endpoints raise `HTTPException(detail={"code","message"})` → renders as `{"detail":{...}}`, but `API_CONTRACTS.md` specifies `{"error":{"code","message"}}`. Consistent across the app but doesn't match the contract; decide and add a global handler.
 - **`ARCHITECTURE.md:51`** still says embeddings `bge-small`/384-d — should be `bge-base`/768-d (the rest of the docs + schema are correct).
-- **Background processing** is FastAPI `BackgroundTasks`, not the planned Redis worker — fine for now; revisit when volume/durability matters. Note the pipeline now chains **OCR → extraction** in one in-process background task (synchronous under TestClient), so a slow extraction blocks the OCR task's worker thread.
+- **Background processing** is FastAPI `BackgroundTasks`, not the planned Redis worker — fine for now; revisit when volume/durability matters. The pipeline now chains **OCR → extraction → embedding** in one in-process background task (synchronous under TestClient), so the whole chain runs on one worker thread; the **bge model loads lazily on first real embedding** (~400 MB, several seconds) — the first upload after a restart pays that cost.
+- **Embeddings validated on real facts** (Phase 4) — bge-base produces 768-d normalized vectors with sensible retrieval rankings (subscription-cost and NDA-term queries nailed their fact). A vague "how much did I spend" query mis-ranked a grocery-item fact above the amount — **expected**, and the reason aggregate/amount queries route to `typed_facts` SQL in Phase 5, not vector search.
 - **Atomic-fact bbox is best-effort** — `_bbox_for_fact` token-overlaps the model's paraphrased fact against OCR-cache blocks on its page (≥0.5 overlap) and attaches a bbox only on a confident match; otherwise null. **PDF text-layer pages carry no blocks** (only the Vision path populates bboxes), so facts from native PDFs get page-only provenance. Revisit if citation highlighting needs tighter spans.
 - **Doc-level summary = first chunk's summary** — for chunked (long) docs, `merge_results` takes the first non-empty chunk summary rather than synthesizing across chunks. Fine for now (page-1 intro is usually representative); a dedicated summary-merge pass would improve long-doc summaries.
 - **Extraction validated on real docs** (Phase 3) via a throwaway smoke harness over `storage/samples/` (3 PDFs + 2 receipt JPEGs) against **live Vision + DeepSeek** — receipts/contract/reports all classified + extracted accurately; reports in `storage/samples/reports/` (gitignored). Quality is good; sparse pages (code listings, rubrics) legitimately yield no atomic facts.
