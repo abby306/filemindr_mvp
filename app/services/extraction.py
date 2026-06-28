@@ -27,12 +27,14 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
+from functools import partial
 
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.core.retry import with_retry
 from app.db.models import (
     Class,
     Document,
@@ -229,6 +231,26 @@ def _deepseek_client():
             api_key=settings.deepseek_api_key, base_url=settings.deepseek_base_url
         )
     return _client
+
+
+def _is_transient_llm(exc: Exception) -> bool:
+    """True for transient DeepSeek/OpenAI errors worth retrying (never 4xx/auth)."""
+    try:
+        import openai
+    except ImportError:  # pragma: no cover - openai is a hard dependency
+        return False
+    if isinstance(
+        exc,
+        (
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.RateLimitError,
+            openai.InternalServerError,
+        ),
+    ):
+        return True
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and (status == 429 or 500 <= status < 600)
 
 
 def call_extraction_model(ocr_text: str, classes: list[Class]) -> tuple[str, str]:
@@ -599,23 +621,52 @@ def run_extraction(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
             else:
                 chunks = [PageChunk(1, document.page_count or 1, document.ocr_text)]
 
+            settings = get_settings()
             raw_chunks: list[dict] = []
             results: list[ExtractionResult] = []
+            failed_chunks: list[dict] = []
             model_name = ""
-            for chunk in chunks:
-                raw, model_name = call_extraction_model(chunk.text, catalog)
-                results.append(parse_extraction(raw))
+            for index, chunk in enumerate(chunks):
+                try:
+                    raw, model_name = with_retry(
+                        partial(call_extraction_model, chunk.text, catalog),
+                        attempts=settings.retry_max_attempts,
+                        base_delay=settings.retry_base_delay,
+                        is_retryable=_is_transient_llm,
+                    )
+                    parsed = parse_extraction(raw)
+                except Exception as exc:  # noqa: BLE001 — tolerate a bad chunk, record it
+                    failed_chunks.append(
+                        {
+                            "chunk": index,
+                            "pages": [chunk.start_page, chunk.end_page],
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+                results.append(parsed)
                 try:
                     raw_chunks.append(json.loads(raw))
                 except json.JSONDecodeError:
                     raw_chunks.append({"raw": raw})
+
+            # Partial tolerance: a doc fails only if *every* chunk failed; one or
+            # more good chunks still produce a (partial) card.
+            if not results:
+                raise RuntimeError(
+                    f"All {len(chunks)} extraction chunk(s) failed: {failed_chunks}"
+                )
             result = merge_results(results)
 
             _clear_previous_extraction(db, account_id, document_id)
             _write_card(db, document, result, catalog)
             fact_count = _write_atomic_facts(db, document, result, cached)
 
-            document.extraction_raw = {"chunk_count": len(chunks), "chunks": raw_chunks}
+            document.extraction_raw = {
+                "chunk_count": len(chunks),
+                "chunks": raw_chunks,
+                "failed_chunks": failed_chunks,
+            }
             document.extraction_model = model_name
             if result.title:
                 document.title = result.title
@@ -630,6 +681,7 @@ def run_extraction(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
                     "model": model_name,
                     "status": document.status,
                     "chunks": len(chunks),
+                    "failed_chunks": len(failed_chunks),
                     "classes": len(result.classes),
                     "entities": (
                         len(result.entities.people)

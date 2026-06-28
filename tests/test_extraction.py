@@ -28,7 +28,7 @@ from app.db.models import (
 )
 from app.db.session import SessionLocal
 from app.main import app
-from app.services import extraction, ocr
+from app.services import embeddings, extraction, ocr
 
 # --- canned model output ---------------------------------------------------
 CANNED = {
@@ -66,8 +66,17 @@ CANNED = {
 
 @pytest.fixture(autouse=True)
 def tmp_storage(monkeypatch, tmp_path):
-    """Keep the OCR-cache lookup (for bbox provenance) off real storage."""
+    """Keep OCR-cache lookups off real storage and the chained embedding offline.
+
+    Extraction chains into embedding for confident docs; stubbing `embed_passages`
+    keeps that fast/deterministic and avoids loading the bge model in extraction
+    tests (the embedding behaviour itself is covered in test_embeddings.py).
+    """
     monkeypatch.setattr(ocr, "get_storage_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        embeddings, "embed_passages",
+        lambda texts: [[0.0] * embeddings.EMBEDDING_DIM for _ in texts],
+    )
 
 
 @pytest.fixture
@@ -169,7 +178,7 @@ def test_run_extraction_writes_card(seeded_account, canned_model) -> None:
 
     with SessionLocal() as db:
         document = db.get(Document, doc_id)
-        assert document.status == "extracted"
+        assert document.status == "indexed"  # extraction chained into embedding
         assert document.title == "Acme Invoice #42"
         assert document.summary.startswith("An invoice")
         assert document.extraction_model == "deepseek-chat-test"
@@ -197,7 +206,7 @@ def test_run_extraction_writes_card(seeded_account, canned_model) -> None:
 
         atomic = db.query(DocumentFact).filter_by(document_id=doc_id).all()
         assert len(atomic) == 1  # blank fact skipped
-        assert atomic[0].embedding is None  # embeddings are Phase 4
+        assert atomic[0].embedding is not None  # chained embedding populated it
 
 
 def test_run_extraction_is_idempotent(seeded_account, canned_model) -> None:
@@ -252,7 +261,7 @@ def test_get_document_returns_card(seeded_account, canned_model) -> None:
     }
     card = client.get(f"/api/v1/documents/{doc_id}", headers=headers).json()
 
-    assert card["status"] == "extracted"
+    assert card["status"] == "indexed"  # extraction chained into embedding
     assert card["classes"][0]["slug"] == "invoice"
     assert card["classes"][0]["name"] == "Invoice"
     assert "Acme Inc" in card["entities"]["organizations"]
@@ -351,7 +360,51 @@ def test_run_extraction_covers_all_pages_via_chunks(seeded_account, monkeypatch)
     assert calls["n"] == 3  # one LLM call per page-chunk
     with SessionLocal() as db:
         document = db.get(Document, doc_id)
-        assert document.status == "extracted"
+        assert document.status == "indexed"  # extraction chained into embedding
         assert document.extraction_raw["chunk_count"] == 3
         facts = db.query(DocumentFact).filter_by(document_id=doc_id).all()
         assert {f.page for f in facts} == {1, 2, 3}  # every page covered
+
+
+def test_run_extraction_tolerates_a_failed_chunk(seeded_account, monkeypatch) -> None:
+    account_id = seeded_account["personal_id"]
+    monkeypatch.setattr(extraction, "_CHUNK_CHAR_BUDGET", 50)
+    page_texts = [f"Page {i} body " + "filler " * 20 for i in range(1, 4)]
+    doc_id = _make_document(account_id, page_texts=page_texts)
+
+    def flaky(text, classes):
+        if "PAGE 2" in text:  # the middle chunk persistently fails
+            raise ValueError("chunk 2 is down")
+        pages = [int(n) for n in re.findall(r"PAGE (\d+)", text)]
+        payload = {
+            "classes": [{"slug": "invoice", "confidence": 0.9}],
+            "atomic_facts": [{"text": f"Fact on page {p}", "page": p} for p in pages],
+        }
+        return json.dumps(payload), "m"
+
+    monkeypatch.setattr(extraction, "call_extraction_model", flaky)
+
+    extraction.run_extraction(doc_id, account_id)
+
+    with SessionLocal() as db:
+        document = db.get(Document, doc_id)
+        assert document.status == "indexed"  # partial success still completes
+        failed = document.extraction_raw["failed_chunks"]
+        assert len(failed) == 1 and failed[0]["pages"] == [2, 2]
+        pages = {f.page for f in db.query(DocumentFact).filter_by(document_id=doc_id).all()}
+        assert pages == {1, 3}  # page 2's chunk was skipped
+
+
+def test_run_extraction_fails_when_all_chunks_fail(seeded_account, monkeypatch) -> None:
+    account_id = seeded_account["personal_id"]
+    doc_id = _make_document(account_id)  # no cache -> single chunk over ocr_text
+
+    def always_fail(text, classes):
+        raise ValueError("model down")
+
+    monkeypatch.setattr(extraction, "call_extraction_model", always_fail)
+
+    extraction.run_extraction(doc_id, account_id)
+
+    with SessionLocal() as db:
+        assert db.get(Document, doc_id).status == "failed"

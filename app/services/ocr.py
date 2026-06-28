@@ -18,11 +18,14 @@ import time
 import uuid
 from collections import Counter
 from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 
 import fitz  # PyMuPDF
 from langdetect import DetectorFactory, LangDetectException, detect
 
+from app.core.config import get_settings
+from app.core.retry import with_retry
 from app.db.models import Document
 from app.db.session import SessionLocal
 from app.services.events import record_event
@@ -87,6 +90,7 @@ class OcrResult:
     language: str | None
     text: str
     pages: list[OcrPage] = field(default_factory=list)
+    failed_pages: list[int] = field(default_factory=list)  # pages Vision dropped
 
     def to_cache(self) -> dict:
         return asdict(self)
@@ -107,6 +111,7 @@ class OcrResult:
             language=data.get("language"),
             text=data["text"],
             pages=pages,
+            failed_pages=data.get("failed_pages", []),
         )
 
 
@@ -199,6 +204,35 @@ def _blocks_from_annotation(annotation) -> tuple[str, list[OcrBlock], list[str]]
     return full_text, blocks, languages
 
 
+def _is_transient_vision(exc: Exception) -> bool:
+    """True for transient Google Vision errors worth retrying (never 4xx/auth)."""
+    try:
+        from google.api_core import exceptions as gexc
+    except ImportError:  # pragma: no cover - google-cloud-vision is a hard dependency
+        return False
+    return isinstance(
+        exc,
+        (
+            gexc.ServiceUnavailable,    # 503
+            gexc.TooManyRequests,       # 429
+            gexc.DeadlineExceeded,      # 504 / timeout
+            gexc.InternalServerError,   # 500
+            gexc.GatewayTimeout,        # 504
+        ),
+    )
+
+
+def _vision_ocr_with_retry(content: bytes) -> tuple[str, list[OcrBlock], list[str]]:
+    """Vision OCR of one image, retrying transient failures."""
+    settings = get_settings()
+    return with_retry(
+        partial(_vision_ocr_image_bytes, content),
+        attempts=settings.retry_max_attempts,
+        base_delay=settings.retry_base_delay,
+        is_retryable=_is_transient_vision,
+    )
+
+
 def _vision_ocr_image_bytes(content: bytes) -> tuple[str, list[OcrBlock], list[str]]:
     from google.cloud import vision
 
@@ -210,7 +244,7 @@ def _vision_ocr_image_bytes(content: bytes) -> tuple[str, list[OcrBlock], list[s
 
 def ocr_image_via_vision(path: str | Path) -> OcrResult:
     content = Path(path).read_bytes()
-    text, blocks, languages = _vision_ocr_image_bytes(content)
+    text, blocks, languages = _vision_ocr_with_retry(content)
     language = Counter(languages).most_common(1)[0][0] if languages else detect_language(text)
     return OcrResult(
         engine=ENGINE_VISION,
@@ -222,18 +256,32 @@ def ocr_image_via_vision(path: str | Path) -> OcrResult:
 
 
 def ocr_pdf_via_vision(path: str | Path) -> OcrResult:
-    """Rasterize each PDF page (PyMuPDF) and OCR it with Vision."""
+    """Rasterize each PDF page (PyMuPDF) and OCR it with Vision.
+
+    Partial tolerance: a page that keeps failing after retries is recorded in
+    `failed_pages` and left with empty text rather than failing the whole
+    document; only an all-pages failure raises.
+    """
     pages: list[OcrPage] = []
     languages: list[str] = []
+    failed_pages: list[int] = []
     zoom = _RASTER_DPI / 72.0
     matrix = fitz.Matrix(zoom, zoom)
     with fitz.open(path) as doc:
         page_count = doc.page_count
         for index, page in enumerate(doc, start=1):
-            pixmap = page.get_pixmap(matrix=matrix)
-            text, blocks, langs = _vision_ocr_image_bytes(pixmap.tobytes("png"))
+            content = page.get_pixmap(matrix=matrix).tobytes("png")
+            try:
+                text, blocks, langs = _vision_ocr_with_retry(content)
+            except Exception:  # noqa: BLE001 — tolerate a bad page, record it
+                failed_pages.append(index)
+                pages.append(OcrPage(page=index, text="", blocks=[]))
+                continue
             languages.extend(langs)
             pages.append(OcrPage(page=index, text=text, blocks=blocks))
+
+    if failed_pages and len(failed_pages) == page_count:
+        raise RuntimeError(f"Vision OCR failed for all {page_count} page(s)")
 
     full_text = "\n\n".join(p.text for p in pages).strip()
     language = Counter(languages).most_common(1)[0][0] if languages else detect_language(full_text)
@@ -243,6 +291,7 @@ def ocr_pdf_via_vision(path: str | Path) -> OcrResult:
         language=language,
         text=full_text,
         pages=pages,
+        failed_pages=failed_pages,
     )
 
 
@@ -339,6 +388,7 @@ def run_ocr(document_id: uuid.UUID, account_id: uuid.UUID) -> None:
                     "language": result.language,
                     "char_count": len(result.text),
                     "cache": "hit" if cache_hit else "miss",
+                    "failed_pages": result.failed_pages,
                 },
             )
             db.commit()

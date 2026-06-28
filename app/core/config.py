@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_model: str = "deepseek-chat"
 
+    # Resilience: bounded retry for transient network failures (timeouts/429/5xx).
+    retry_max_attempts: int = 3
+    retry_base_delay: float = 0.5
+
     # Local filesystem + runtime
     storage_dir: str = "./storage"
     app_env: str = "development"

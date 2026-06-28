@@ -80,3 +80,50 @@ def test_detect_language_english() -> None:
 
 def test_detect_language_too_short() -> None:
     assert ocr.detect_language("hi") is None
+
+
+# --- Vision partial tolerance (per-page; seam stubbed, no network) ----------
+def _blank_pdf(path, pages: int) -> None:
+    doc = fitz.open()
+    for _ in range(pages):
+        doc.new_page()
+    doc.save(path)
+    doc.close()
+
+
+def test_pdf_vision_skips_a_failed_page(monkeypatch, tmp_path) -> None:
+    pdf = tmp_path / "scan.pdf"
+    _blank_pdf(pdf, 3)
+    calls = {"n": 0}
+
+    def stub(content):
+        calls["n"] += 1
+        if calls["n"] == 2:  # page 2 persistently fails
+            raise ValueError("transient-ish but non-retryable here")
+        return ("page text", [], ["en"])
+
+    monkeypatch.setattr(ocr, "_vision_ocr_image_bytes", stub)
+    result = ocr.ocr_pdf_via_vision(str(pdf))
+
+    assert result.page_count == 3
+    assert result.failed_pages == [2]
+    assert len(result.pages) == 3
+    assert result.pages[1].text == ""  # the dropped page is empty
+    assert result.pages[0].text == "page text"
+
+
+def test_pdf_vision_all_pages_fail_raises(monkeypatch, tmp_path) -> None:
+    pdf = tmp_path / "scan.pdf"
+    _blank_pdf(pdf, 2)
+    monkeypatch.setattr(ocr, "_vision_ocr_image_bytes", lambda content: (_ for _ in ()).throw(ValueError("boom")))
+
+    with pytest.raises(RuntimeError, match="all 2 page"):
+        ocr.ocr_pdf_via_vision(str(pdf))
+
+
+def test_failed_pages_round_trips_through_cache() -> None:
+    result = ocr.OcrResult(
+        engine=ocr.ENGINE_VISION, page_count=2, language="en", text="x",
+        pages=[ocr.OcrPage(page=1, text="x")], failed_pages=[2],
+    )
+    assert ocr.OcrResult.from_cache(result.to_cache()).failed_pages == [2]
