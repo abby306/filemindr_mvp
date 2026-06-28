@@ -8,6 +8,8 @@ a `seeded_account`; the account's cascade delete tidies up on teardown.
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
 
 import pytest
@@ -94,6 +96,36 @@ def test_embed_passages_has_no_prefix(monkeypatch) -> None:
 
 def test_embed_passages_empty_is_noop() -> None:
     assert embeddings.embed_passages([]) == []
+
+
+def test_model_loads_once_under_concurrency(monkeypatch) -> None:
+    """Concurrent first-calls must initialize the encoder exactly once."""
+    monkeypatch.setattr(embeddings, "_model", None)
+    calls = {"n": 0}
+
+    def slow_load():
+        calls["n"] += 1
+        time.sleep(0.05)  # widen the race window
+        return object()
+
+    monkeypatch.setattr(embeddings, "_load_model", slow_load)
+
+    results: list = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()  # release all threads into _get_model at once
+        results.append(embeddings._get_model())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert calls["n"] == 1  # loaded exactly once
+    assert len({id(r) for r in results}) == 1  # everyone got the same instance
+    monkeypatch.setattr(embeddings, "_model", None)  # reset for other tests
 
 
 # --- run_embedding fan-out (live DB) ---------------------------------------
