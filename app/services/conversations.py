@@ -100,11 +100,15 @@ def record_trace(db, account_id: uuid.UUID, message_id: uuid.UUID, result) -> No
         query_text=result.query,
         intent=result.intent or None,
         retrieval_plan={
+            **(result.plan or {}),
             "searches": result.searches,
             "documents_looked_up": result.documents_looked_up,
             "candidates_seen": result.candidates_seen,
             "supported": result.supported,
+            "escalated": result.escalated,
         },
+        candidates=result.candidate_facts or None,
+        context_sent={"corpus_documents": (result.plan or {}).get("corpus_documents")},
         answer=result.answer,
         citations=[
             {
@@ -166,3 +170,65 @@ def chat(
     finally:
         if own:
             db.close()
+
+
+def chat_stream(
+    account_id: uuid.UUID,
+    user_message: str,
+    *,
+    conversation_id: uuid.UUID | None = None,
+    user_id: uuid.UUID | None = None,
+    document_ids: list[uuid.UUID] | None = None,
+):
+    """Streaming variant of `chat`: yields the agent's step events, then persists.
+
+    A generator (run by Starlette in a worker thread) that opens **its own session**,
+    forwards `synthesize_iter`'s events, then persists both messages + the trace and
+    yields a final ``done`` event with the assistant `message_id` + citations. Assumes
+    the caller has already validated the conversation/document scope.
+    """
+    from app.services.synthesis import synthesize_iter  # local import avoids a cycle
+
+    db = SessionLocal()
+    try:
+        if conversation_id is None:
+            convo = Conversation(account_id=account_id, user_id=user_id)
+            db.add(convo)
+            db.flush()
+            conversation_id = convo.id
+        yield {"type": "conversation", "conversation_id": str(conversation_id)}
+
+        history = load_history(db, account_id, conversation_id)
+        result = None
+        for event in synthesize_iter(
+            user_message, account_id, history=history, db=db, document_ids=document_ids
+        ):
+            if event["type"] == "result":
+                result = event["result"]
+            else:
+                yield event
+
+        add_message(db, account_id, conversation_id, "user", user_message)
+        message_id = add_message(db, account_id, conversation_id, "assistant", result.answer)
+        record_trace(db, account_id, message_id, result)
+        db.commit()
+        yield {
+            "type": "done",
+            "message_id": str(message_id),
+            "conversation_id": str(conversation_id),
+            "answer": result.answer,
+            "supported": result.supported,
+            "escalated": result.escalated,
+            "model": result.model,
+            "citations": [
+                {
+                    "document_id": str(c.document_id),
+                    "title": c.title,
+                    "page": c.page,
+                    "fact_id": str(c.fact_id) if c.fact_id else None,
+                }
+                for c in result.citations
+            ],
+        }
+    finally:
+        db.close()

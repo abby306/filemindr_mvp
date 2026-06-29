@@ -40,6 +40,7 @@ from app.services import catalog, retrieval
 from app.services.retrieval import FactHit
 
 MODEL = "gemini-2.5-flash"
+HARD_MODEL = "gpt-4o"  # escalation when the Flash loop can't ground an answer
 _POOL_SIZE = 12  # candidates fetched per retrieval (initial + each tool search)
 _MAX_STEPS = 5  # model turns: find/search a few times, then a forced finish
 
@@ -91,10 +92,13 @@ class SynthesisResult:
     searches: list[str] = field(default_factory=list)  # follow-up queries issued
     documents_looked_up: list[str] = field(default_factory=list)  # find_documents queries
     candidates_seen: int = 0
+    escalated: bool = False  # answered by the hard model (GPT-4o) after a Flash miss
     model: str = MODEL
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: int = 0
+    candidate_facts: list[dict] = field(default_factory=list)  # all facts the model saw (trace)
+    plan: dict = field(default_factory=dict)  # retrieval plan + searches (trace)
 
 
 @dataclass
@@ -133,6 +137,10 @@ class _FactRegistry:
 
     def get(self, short_id: str) -> FactHit | None:
         return self._by_id.get(short_id)
+
+    def items(self) -> list[tuple[str, FactHit]]:
+        """All (short_id, hit) pairs seen so far — for the trace candidate dump."""
+        return list(self._by_id.items())
 
     def __len__(self) -> int:
         return len(self._by_id)
@@ -278,6 +286,64 @@ def _gemini_turn(transcript: list[dict], *, allow_search: bool, model: str) -> M
     return ModelTurn(tool=None, text=resp.text or "", prompt_tokens=pt, completion_tokens=ct)
 
 
+# --- hard-synthesis escalation (GPT-4o, single-shot) -----------------------
+
+_openai_client_singleton = None
+_openai_lock = threading.Lock()
+
+_HARD_SYSTEM = (
+    "You are a careful document QA assistant. Answer the question using ONLY the "
+    "candidate facts provided (each has an id like 'f3'). Never use outside knowledge. "
+    "Cite the facts you used. If the facts don't contain the answer, set supported=false "
+    "and say so. Respond as JSON: {\"answer\": str, \"cited_fact_ids\": [str], "
+    "\"supported\": bool}."
+)
+
+
+def _openai_client():
+    global _openai_client_singleton
+    if _openai_client_singleton is None:
+        with _openai_lock:
+            if _openai_client_singleton is None:
+                from openai import OpenAI
+
+                _openai_client_singleton = OpenAI(api_key=get_settings().openai_api_key)
+    return _openai_client_singleton
+
+
+def _openai_resynthesize(query: str, candidates: list[dict], history: list[dict] | None) -> dict:
+    """One GPT-4o pass over the candidate facts → ``{answer, cited_fact_ids, supported}``.
+
+    The escalation seam: a second, stronger opinion when Flash couldn't ground an
+    answer. No tools — it only re-reasons over facts we already retrieved. Tests stub
+    this so the suite stays offline. ``_pt``/``_ct`` carry token usage for the trace.
+    """
+    facts_block = "\n".join(
+        f'{c["id"]}: {c["text"]} (document: {c["document"]}, page {c["page"]})'
+        for c in candidates
+    )
+    convo = ""
+    if history:
+        convo = "Conversation so far:\n" + "\n".join(
+            f'{t["role"]}: {t["content"]}' for t in history
+        ) + "\n\n"
+    user = f"{convo}Question: {query}\n\nCandidate facts:\n{facts_block}"
+    resp = _openai_client().chat.completions.create(
+        model=HARD_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _HARD_SYSTEM},
+            {"role": "user", "content": user},
+        ],
+    )
+    raw = json.loads(resp.choices[0].message.content or "{}")
+    usage = resp.usage
+    raw["_pt"] = getattr(usage, "prompt_tokens", 0) or 0
+    raw["_ct"] = getattr(usage, "completion_tokens", 0) or 0
+    return raw
+
+
 # --- payload shaping -------------------------------------------------------
 
 
@@ -345,7 +411,46 @@ def _build_result(args, facts, titles, *, query, intent, searches, lookups,
 # --- public entry point ----------------------------------------------------
 
 
-def synthesize(
+def _candidate_dump(facts: _FactRegistry, titles: dict) -> list[dict]:
+    """Every fact the model saw, shaped for the retrieval trace."""
+    return _fact_payload(facts.items(), titles)
+
+
+def _try_escalate(
+    query: str, facts: _FactRegistry, titles: dict, history: list[dict] | None,
+    prev: SynthesisResult, started: float,
+) -> SynthesisResult | None:
+    """Single-shot GPT-4o re-synthesis over the candidate pool; adopt only if grounded.
+
+    Returns a new `SynthesisResult` when the hard model finds support, else None (so
+    the honest `supported=false` answer stands). Reuses the citation registry, so its
+    cited ids are validated exactly like the Flash path.
+    """
+    candidates = _candidate_dump(facts, titles)
+    if not candidates:
+        return None
+    try:
+        raw = _openai_resynthesize(query, candidates, history)
+    except Exception:
+        # Escalation is best-effort: if the hard model is unavailable (rate limit,
+        # network, billing), keep the honest Flash `supported=false` answer rather
+        # than failing the whole request.
+        return None
+    if not raw or not raw.get("supported"):
+        return None
+    result = _build_result(
+        raw, facts, titles, query=query, intent=prev.intent, searches=prev.searches,
+        lookups=prev.documents_looked_up, model=HARD_MODEL,
+        pt=prev.prompt_tokens + (raw.get("_pt") or 0),
+        ct=prev.completion_tokens + (raw.get("_ct") or 0), started=started,
+    )
+    result.escalated = True
+    result.candidate_facts = prev.candidate_facts
+    result.plan = prev.plan
+    return result
+
+
+def synthesize_iter(
     query: str,
     account_id: uuid.UUID,
     *,
@@ -354,17 +459,14 @@ def synthesize(
     model: str = MODEL,
     max_steps: int = _MAX_STEPS,
     document_ids: list[uuid.UUID] | None = None,
-) -> SynthesisResult:
-    """Answer `query` for `account_id` via the corpus-aware agentic loop.
+):
+    """The agentic loop as an event stream (for SSE), ending in the final result.
 
-    Seeds the model with a bounded corpus overview, an initial candidate pool, and
-    the conversation `history` (``[{role, content}]``), then lets it find documents
-    and search (bounded) before committing a grounded, cited answer. Opens its own
-    session if one isn't supplied.
-
-    When `document_ids` is given, the initial retrieval is pinned to those documents
-    and the agent is told the question is scoped to them (its `search` tool can still
-    widen via `document_ref`/`class` if it needs to).
+    Yields step events — ``{"type": "intent"|"find_documents"|"searching"|
+    "escalating", ...}`` — and finally ``{"type": "result", "result": SynthesisResult}``.
+    `synthesize()` drains this; the streaming endpoint forwards the events. Same
+    contract as `synthesize` otherwise (corpus overview + initial pool + history seed
+    the model; bounded loop with a forced finish; `document_ids` pins retrieval).
     """
     started = time.monotonic()
     own_session = db is None
@@ -377,11 +479,13 @@ def synthesize(
         overview = catalog.corpus_overview(db, account_id)
         overview_docs = docs.add(overview.pop("documents"))
         overview["documents"] = _doc_payload(overview_docs)
+        corpus_doc_count = overview.get("total_documents", len(overview_docs))
 
         first = retrieval.retrieve(
             query, account_id, db=db, k=_POOL_SIZE, document_ids=document_ids
         )
         intent = first.intent
+        yield {"type": "intent", "intent": intent}
         _load_doc_meta(db, account_id, [h.document_id for h in first.facts], titles)
         initial = facts.add(first.facts)
 
@@ -403,6 +507,7 @@ def synthesize(
         searches: list[str] = []
         lookups: list[str] = []
         pt = ct = 0
+        result: SynthesisResult | None = None
 
         for step in range(max_steps):
             allow_search = step < max_steps - 1  # force finish on the last turn
@@ -412,8 +517,9 @@ def synthesize(
             transcript.append({"role": "model", "tool": turn.tool or "finish", "args": turn.args})
 
             if turn.tool == "find_documents" and allow_search:
-                lookups.append(turn.args.get("name") or turn.args.get("about")
-                               or turn.args.get("class") or "filter")
+                name = (turn.args.get("name") or turn.args.get("about")
+                        or turn.args.get("class") or "filter")
+                lookups.append(name)
                 found = catalog.find_documents(
                     db, account_id,
                     class_slug=turn.args.get("class"),
@@ -425,6 +531,7 @@ def synthesize(
                 added = docs.add(found)
                 transcript.append({"role": "tool", "name": "find_documents",
                                    "response": {"documents": _doc_payload(added)}})
+                yield {"type": "find_documents", "query": name, "found": len(added)}
                 continue
 
             if turn.tool == "search" and allow_search:
@@ -441,21 +548,61 @@ def synthesize(
                 added = facts.add(res.facts)
                 transcript.append({"role": "tool", "name": "search",
                                    "response": {"candidates": _fact_payload(added, titles)}})
+                yield {"type": "searching", "query": rq, "found": len(added)}
                 continue
 
             if turn.tool == "finish" or "answer" in turn.args:
-                return _build_result(turn.args, facts, titles, query=query, intent=intent,
-                                     searches=searches, lookups=lookups, model=model,
-                                     pt=pt, ct=ct, started=started)
+                result = _build_result(turn.args, facts, titles, query=query, intent=intent,
+                                       searches=searches, lookups=lookups, model=model,
+                                       pt=pt, ct=ct, started=started)
+                break
             break  # model failed to finish (e.g. searched on the forced-finish turn)
 
-        return SynthesisResult(
-            query=query,
-            answer="I couldn't find enough information in your documents to answer that.",
-            supported=False, intent=intent, searches=searches, documents_looked_up=lookups,
-            candidates_seen=len(facts), model=model, prompt_tokens=pt, completion_tokens=ct,
-            latency_ms=int((time.monotonic() - started) * 1000),
-        )
+        if result is None:
+            result = SynthesisResult(
+                query=query,
+                answer="I couldn't find enough information in your documents to answer that.",
+                supported=False, intent=intent, searches=searches, documents_looked_up=lookups,
+                candidates_seen=len(facts), model=model, prompt_tokens=pt, completion_tokens=ct,
+                latency_ms=int((time.monotonic() - started) * 1000),
+            )
+
+        result.candidate_facts = _candidate_dump(facts, titles)
+        result.plan = {**first.plan, "searches": searches}
+        result.plan["corpus_documents"] = corpus_doc_count
+
+        if not result.supported:
+            yield {"type": "escalating", "model": HARD_MODEL}
+            escalated = _try_escalate(query, facts, titles, history, result, started)
+            if escalated is not None:
+                result = escalated
+
+        yield {"type": "result", "result": result}
     finally:
         if own_session:
             db.close()
+
+
+def synthesize(
+    query: str,
+    account_id: uuid.UUID,
+    *,
+    db=None,
+    history: list[dict] | None = None,
+    model: str = MODEL,
+    max_steps: int = _MAX_STEPS,
+    document_ids: list[uuid.UUID] | None = None,
+) -> SynthesisResult:
+    """Answer `query` for `account_id` via the corpus-aware agentic loop.
+
+    Thin drain of `synthesize_iter` (the event-producing core) — same behavior, just
+    discarding the step events and returning the final `SynthesisResult`.
+    """
+    result: SynthesisResult | None = None
+    for event in synthesize_iter(
+        query, account_id, db=db, history=history, model=model,
+        max_steps=max_steps, document_ids=document_ids,
+    ):
+        if event["type"] == "result":
+            result = event["result"]
+    return result  # type: ignore[return-value]

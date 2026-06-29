@@ -7,8 +7,11 @@ exercises the auth + account-scoping path end to end.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -24,6 +27,12 @@ app = FastAPI(title="filemindr", version="0.1.0")
 
 app.include_router(documents_router)
 app.include_router(conversations_router)
+
+# Dev-only: serve the throwaway testing UI same-origin (no CORS) at /dev/. Inert in
+# any non-development env and when the (git-ignored) dev_ui/ directory is absent.
+_dev_ui = Path(__file__).resolve().parent.parent / "dev_ui"
+if settings.app_env == "development" and _dev_ui.is_dir():
+    app.mount("/dev", StaticFiles(directory=str(_dev_ui), html=True), name="dev_ui")
 
 
 @app.get("/health", tags=["ops"])

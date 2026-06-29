@@ -50,7 +50,8 @@ Live backlog. Move items between sections; keep entries one line. `[ ]` todo, `[
 - [x] Agentic, corpus-aware grounded answers with citations + `supported` path (`synthesis.py`, Gemini 2.5 Flash + `find_documents`/`search`/`finish` tools).
 - [x] Conversation memory + `chat()` (`conversations.py`); document catalog (`catalog.py`); CLIs (`ask`, `chat`, `retrieve`, `eval_retrieval`, `seed_corpus`).
 - [x] Chat HTTP endpoints (`POST /conversations`, `POST /conversations/{id}/messages` incl. `scope="document"`, `GET /conversations/{id}/messages`); map `RetrievalTrace` ORM + write one `retrieval_traces` row per answer (`conversations.record_trace`).
-- [ ] SSE streaming (dedicated `POST /conversations/{id}/messages/stream`), GPT-4o hard-synthesis escalation, wire `synthesize` into `eval/`, fuller trace cols (candidates/reranked/context_sent). ← **Phase 5 remaining**
+- [x] SSE streaming (`POST /conversations/{id}/messages/stream` via `synthesize_iter`); GPT-4o hard-synthesis escalation on `supported=false`; `scripts/eval_synthesis.py` (answer_correctness); fuller trace cols (candidates/context_sent). **Phase 5 complete.**
+- [x] Ratings endpoint `POST /messages/{id}/rating` + `AnswerRating` ORM (pulled forward from Phase 7 for testing); dev-only testing UI at `/dev/` (uncommitted `dev_ui/`).
 
 **Quality**
 - [x] Eval harness scaffold: gold queries, recall@k, answer correctness (`eval/`); `scripts/eval_retrieval.py` scores live retrieval.
