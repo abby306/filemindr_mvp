@@ -11,9 +11,10 @@
 ```
 Upload (PDF/image/docx/email)
   → OCR (PyMuPDF text layer → Google Vision fallback)
-  → Structured extraction (type, facts, entities, dates) — one cheap LLM pass
+  → Structured extraction (type, facts, entities, dates) — one cheap LLM pass (DeepSeek)
   → Vector + FTS index (bge-base-en-v1.5, 768-dim, local, CPU)
-  → Chat Q&A with citations over the whole archive
+  → Hybrid retrieval (structured + lexical + vector, fused with RRF) → cross-encoder rerank
+  → Agentic chat Q&A with citations (Gemini 2.5 Flash; GPT-4o escalation on hard misses)
 ```
 
 Each document goes through a four-stage pipeline: `received → ocr_done → extracted → indexed`. Every stage is append-only logged in `processing_events`; debugging is a SELECT, not a re-run.
@@ -26,12 +27,13 @@ Each document goes through a four-stage pipeline: `received → ocr_done → ext
 |---|---|
 | API | FastAPI (Python 3.12) |
 | Database | PostgreSQL 16 + pgvector 0.8 |
-| Cache / queue | Redis 7 |
+| Cache / queue | Redis 7 *(installed; background work currently via FastAPI `BackgroundTasks`)* |
 | Embeddings | `bge-base-en-v1.5` — local, 768-dim, CPU, zero per-token cost |
+| Reranking | `bge-reranker-base` — local cross-encoder, CPU, blended with RRF |
 | OCR | PyMuPDF (text-layer probe) + Google Vision (fallback / images) |
-| Extraction | GPT-4o-mini / DeepSeek (cheap structured-output pass) |
-| Synthesis | GPT-4o (grounded answers, low-confidence re-checks) |
-| Frontend | Next.js + Tailwind + Radix UI *(planned)* |
+| Extraction | DeepSeek `deepseek-chat` (cheap structured-output pass) |
+| Synthesis | Gemini 2.5 Flash (agentic, grounded, cited); GPT-4o escalation on `supported=false` |
+| Frontend | Next.js + Tailwind + Radix UI *(planned)*; a throwaway dev testing UI ships at `/dev/` |
 
 Full design docs live in [`agent_guide/`](agent_guide/) — start with [`ARCHITECTURE.md`](agent_guide/ARCHITECTURE.md) and [`TECH_SPEC.md`](agent_guide/TECH_SPEC.md).
 
@@ -42,23 +44,25 @@ Full design docs live in [`agent_guide/`](agent_guide/) — start with [`ARCHITE
 ```
 filemindr/
 ├── app/
-│   ├── api/            # HTTP route handlers (built per phase)
+│   ├── api/            # HTTP routes: documents.py, conversations.py (chat/SSE/ratings), schemas.py
 │   ├── core/
 │   │   ├── config.py         # pydantic-settings (DATABASE_URL, keys, etc.)
 │   │   ├── auth.py           # get_current_user (bearer token → User)
 │   │   ├── scoping.py        # AccountScope + get_current_account
+│   │   ├── retry.py / concurrency.py  # bounded retries + bounded network fan-out
 │   │   └── default_classes.py  # 14 predefined document classes
 │   ├── db/
 │   │   ├── models.py   # SQLAlchemy ORM mapped to existing schema (no create_all)
 │   │   └── session.py  # engine + get_db dependency
-│   ├── services/       # OCR, extraction, retrieval, LLM clients (planned)
-│   ├── workers/        # Background jobs via Redis (planned)
-│   └── main.py         # App entry point, /health, /api/v1/me
+│   ├── services/       # ocr, extraction, embeddings, retrieval, reranking,
+│   │                   #   synthesis, catalog, conversations, storage, events, reprocessing
+│   └── main.py         # App entry point, /health, /api/v1/me, dev /dev/ UI mount
 ├── alembic/            # Migrations — schema source of truth
-│   └── versions/0001_initial_schema.py
-├── scripts/
-│   └── seed.py         # Idempotent: dev user, 2 accounts, default classes
-├── tests/              # 19 passing tests (config, DB, scoping, routes)
+│   └── versions/       # 0001_initial_schema, 0002_summary_embedding_hnsw
+├── scripts/            # seed, seed_corpus, reprocess, ask, chat, retrieve,
+│                       #   eval_retrieval, eval_synthesis
+├── eval/               # Retrieval/synthesis eval harness (scorers, gold set, runner)
+├── tests/              # 168 passing tests (every network/model seam mocked)
 ├── agent_guide/        # Full design docs (PRD, ARCHITECTURE, TECH_SPEC, API_CONTRACTS…)
 ├── schema.sql          # Canonical DDL (applied via Alembic)
 ├── .env.example        # Copy to .env and fill in keys
@@ -110,15 +114,21 @@ source .venv/bin/activate
 
 pip install fastapi "uvicorn[standard]" sqlalchemy "psycopg[binary]" pgvector \
             alembic pydantic "pydantic-settings" python-multipart httpx \
-            openai google-cloud-vision pymupdf python-docx pytest
+            openai google-genai google-cloud-vision pymupdf python-docx \
+            sentence-transformers langdetect pyyaml pytest
 ```
+
+> No `requirements.txt` yet — dependencies live in the venv. `sentence-transformers`
+> pulls in `torch` (the local bge embedder + reranker run on CPU). `openai` is reused
+> for both DeepSeek (custom `base_url`) and GPT-4o; `google-genai` drives Gemini.
 
 ### 4. Environment
 
 ```bash
 cp .env.example .env
-# Edit .env — fill in OPENAI_API_KEY (and DEEPSEEK_API_KEY / GOOGLE_APPLICATION_CREDENTIALS
-# if you want those providers). DATABASE_URL and REDIS_URL are pre-filled for the local setup.
+# Edit .env — fill in DEEPSEEK_API_KEY (extraction), GEMINI_API_KEY (synthesis),
+# OPENAI_API_KEY (GPT-4o escalation), and GOOGLE_APPLICATION_CREDENTIALS (Vision OCR).
+# DATABASE_URL and REDIS_URL are pre-filled for the local setup.
 ```
 
 ### 5. Apply schema + seed
@@ -153,6 +163,18 @@ curl -H "Authorization: Bearer <user-uuid>" \
      localhost:8000/api/v1/me
 ```
 
+**Try the full pipeline (live APIs):**
+
+```bash
+python -m scripts.seed_corpus      # ingest storage/samples/* through OCR→extraction→embedding
+python -m scripts.ask "<question>" # one-shot grounded answer with citations
+python -m scripts.chat             # interactive multi-turn chat with memory
+```
+
+In development, a throwaway testing UI (document list + chat + streamed steps +
+thumbs/stars rating) is served at [http://localhost:8000/dev/](http://localhost:8000/dev/)
+when a local `dev_ui/` directory exists (git-ignored).
+
 ---
 
 ## Tenancy & security model
@@ -175,10 +197,10 @@ Request auth: `Authorization: Bearer <user_id>` resolves the user; `X-Account-Id
 
 ```bash
 pytest -q
-# 19 passed in ~0.5s (against the live local DB)
+# 168 passed (against the live local DB; all network/model seams mocked)
 ```
 
-Tests cover: config loading + overrides, DB connectivity + pgvector presence, account isolation (scoping refuses cross-account reads), and route-level auth/403 gating. All fixtures roll back or cascade-delete after themselves.
+Tests cover the whole pipeline offline: config/DB/pgvector, account isolation (scoping refuses cross-account reads), OCR routing, extraction parsing + fan-out, embeddings, hybrid retrieval + RRF + reranking, the agentic synthesis loop (incl. GPT-4o escalation), conversation memory, and every HTTP route (upload, chat, SSE streaming, ratings). DeepSeek, Vision, the bge encoder/reranker, and the Gemini + GPT-4o seams are all mocked — no live calls, no model downloads. All fixtures roll back or cascade-delete after themselves.
 
 ---
 
@@ -187,10 +209,10 @@ Tests cover: config loading + overrides, DB connectivity + pgvector presence, ac
 | Phase | Status | Scope |
 |---|---|---|
 | **1 — Foundations** | ✅ Done | Config, ORM, session, auth, scoping, /health, seed |
-| **2 — Ingest** | Planned | Upload endpoint (PDF/image/docx), hash dedup, `received` status |
-| **3 — OCR** | Planned | PyMuPDF probe → Google Vision fallback; OCR cache |
-| **4 — Extraction** | Planned | Structured LLM pass → card + atomic facts + embeddings → `indexed` |
-| **5 — Retrieval** | Planned | Intent router, metadata/FTS/vector lanes, reranker, grounded synthesis |
+| **2 — Ingest** | ✅ Done | Upload endpoint (PDF/image/docx), streaming + hash dedup, `received` status |
+| **3 — OCR** | ✅ Done | PyMuPDF probe → Google Vision fallback; block bboxes; OCR cache |
+| **4 — Extraction** | ✅ Done | Structured LLM pass → card + atomic facts + embeddings → `indexed` |
+| **5 — Retrieval + synthesis** | ✅ Done | Intent router, structured/FTS/vector lanes + RRF, reranker, agentic synthesis (Gemini + GPT-4o escalation), chat endpoints, SSE streaming, retrieval traces, ratings |
 | **6 — Frontend** | Planned | Next.js: Upload, Document view, Ask, Ratings |
 | **7 — Analytics / Billing** | Planned | Usage counters, subscription tiers, quota enforcement |
 
@@ -209,7 +231,10 @@ All in [`agent_guide/`](agent_guide/):
 | [`TECH_SPEC.md`](agent_guide/TECH_SPEC.md) | Schema outline, runtime models, retrieval algorithm |
 | [`API_CONTRACTS.md`](agent_guide/API_CONTRACTS.md) | Endpoint shapes, request/response types |
 | [`AGENTS.md`](agent_guide/AGENTS.md) | Rules for AI coding agents working in this repo |
+| [`CODING_STANDARDS.md`](agent_guide/CODING_STANDARDS.md) | Conventions: style, seams, scoping, tests |
 | [`setup.md`](agent_guide/setup.md) | Machine + environment reference |
+
+A live development handoff (current state, file-by-file map) lives in [`STATUS.md`](STATUS.md).
 
 ---
 
