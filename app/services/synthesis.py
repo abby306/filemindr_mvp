@@ -429,7 +429,13 @@ def _try_escalate(
     candidates = _candidate_dump(facts, titles)
     if not candidates:
         return None
-    raw = _openai_resynthesize(query, candidates, history)
+    try:
+        raw = _openai_resynthesize(query, candidates, history)
+    except Exception:
+        # Escalation is best-effort: if the hard model is unavailable (rate limit,
+        # network, billing), keep the honest Flash `supported=false` answer rather
+        # than failing the whole request.
+        return None
     if not raw or not raw.get("supported"):
         return None
     result = _build_result(

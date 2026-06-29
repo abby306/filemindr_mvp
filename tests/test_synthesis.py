@@ -221,3 +221,20 @@ def test_escalation_keeps_unsupported_when_gpt4o_also_misses(no_db, monkeypatch)
     assert res.supported is False
     assert res.escalated is False
     assert res.model == synthesis.MODEL
+
+
+def test_escalation_failure_falls_back_to_flash_answer(no_db, monkeypatch) -> None:
+    # Hard model is unavailable (e.g. rate limit / billing) — must NOT crash the answer.
+    _stub_retrieve(monkeypatch, [_fact("k1", "A fact.", fact_id=uuid.uuid4())])
+    _script(monkeypatch, [
+        ModelTurn(tool="finish", args={"answer": "Honest miss.", "cited_fact_ids": [], "supported": False}),
+    ])
+    def boom(query, candidates, history):
+        raise RuntimeError("429 billing_not_active")
+    monkeypatch.setattr(synthesis, "_openai_resynthesize", boom)
+
+    res = synthesis.synthesize("q", uuid.uuid4())  # no exception
+
+    assert res.supported is False
+    assert res.escalated is False
+    assert res.answer == "Honest miss."
