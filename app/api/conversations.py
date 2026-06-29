@@ -8,9 +8,11 @@ read/write is account-scoped through `AccountScope`, so no chat can cross accoun
 
 from __future__ import annotations
 
+import json
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
 from app.api.schemas import (
@@ -19,12 +21,53 @@ from app.api.schemas import (
     MessageAnswerOut,
     MessageCreate,
     MessageOut,
+    MessageRatingIn,
+    OkOut,
 )
 from app.core.scoping import AccountScope, get_current_account
-from app.db.models import Conversation, Document, Message
+from app.db.models import AnswerRating, Conversation, Document, Message
 from app.services import conversations
 
 router = APIRouter(prefix="/api/v1", tags=["conversations"])
+
+
+def _resolve_document_scope(
+    scope: AccountScope, body: MessageCreate
+) -> list[uuid.UUID] | None:
+    """Validate a `scope="document"` request → the pinned document ids (or None).
+
+    400 if `scope="document"` without a `document_id`; 404 if that document isn't in
+    the active account.
+    """
+    if body.scope != "document":
+        return None
+    if body.document_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "document_id_required",
+                "message": "scope='document' requires document_id.",
+            },
+        )
+    doc = scope.db.scalar(scope.select(Document).where(Document.id == body.document_id))
+    if doc is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "not_found", "message": "Document not found."},
+        )
+    return [body.document_id]
+
+
+def _require_conversation(scope: AccountScope, conversation_id: uuid.UUID) -> None:
+    """404 unless `conversation_id` belongs to the active account."""
+    convo = scope.db.scalar(
+        scope.select(Conversation).where(Conversation.id == conversation_id)
+    )
+    if convo is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "not_found", "message": "Conversation not found."},
+        )
 
 
 @router.post(
@@ -56,25 +99,7 @@ def post_message(
     `scope="document"` pins the answer to `document_id` (which must belong to the
     active account). Returns 404 for an unknown/foreign conversation or document.
     """
-    document_ids: list[uuid.UUID] | None = None
-    if body.scope == "document":
-        if body.document_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "document_id_required",
-                    "message": "scope='document' requires document_id.",
-                },
-            )
-        doc = scope.db.scalar(
-            scope.select(Document).where(Document.id == body.document_id)
-        )
-        if doc is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={"code": "not_found", "message": "Document not found."},
-            )
-        document_ids = [body.document_id]
+    document_ids = _resolve_document_scope(scope, body)
 
     try:
         result, _, message_id = conversations.chat(
@@ -107,6 +132,35 @@ def post_message(
     )
 
 
+def _sse(events) -> "object":
+    """Format an iterable of event dicts as a Server-Sent Events byte stream."""
+    for event in events:
+        yield f"event: {event['type']}\ndata: {json.dumps(event, default=str)}\n\n"
+
+
+@router.post("/conversations/{conversation_id}/messages/stream")
+def post_message_stream(
+    conversation_id: uuid.UUID,
+    body: MessageCreate,
+    scope: AccountScope = Depends(get_current_account),
+) -> StreamingResponse:
+    """Same as POST messages, but streams the agent's steps as Server-Sent Events.
+
+    Emits `intent` → `find_documents`/`searching` → (`escalating`) → `done` (the final
+    answer + citations). Scope/conversation are validated up front, before streaming.
+    """
+    document_ids = _resolve_document_scope(scope, body)
+    _require_conversation(scope, conversation_id)
+    events = conversations.chat_stream(
+        scope.account_id,
+        body.content,
+        conversation_id=conversation_id,
+        user_id=scope.user.id,
+        document_ids=document_ids,
+    )
+    return StreamingResponse(_sse(events), media_type="text/event-stream")
+
+
 @router.get(
     "/conversations/{conversation_id}/messages",
     response_model=list[MessageOut],
@@ -116,14 +170,7 @@ def list_messages(
     scope: AccountScope = Depends(get_current_account),
 ) -> list[MessageOut]:
     """Return the conversation's full message history, oldest first."""
-    convo = scope.db.scalar(
-        scope.select(Conversation).where(Conversation.id == conversation_id)
-    )
-    if convo is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "not_found", "message": "Conversation not found."},
-        )
+    _require_conversation(scope, conversation_id)
     rows = scope.db.scalars(
         select(Message)
         .where(
@@ -133,3 +180,37 @@ def list_messages(
         .order_by(Message.created_at.asc(), Message.id.asc())
     ).all()
     return [MessageOut.model_validate(m) for m in rows]
+
+
+@router.post("/messages/{message_id}/rating", response_model=OkOut)
+def rate_message(
+    message_id: uuid.UUID,
+    body: MessageRatingIn,
+    scope: AccountScope = Depends(get_current_account),
+) -> OkOut:
+    """Attach a rating to an assistant answer (feedback for eval/quality).
+
+    404 unless the message belongs to the active account. Writes an `answer_ratings`
+    row linked to the message (and its retrieval trace).
+    """
+    message = scope.db.scalar(
+        scope.select(Message).where(Message.id == message_id)
+    )
+    if message is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "not_found", "message": "Message not found."},
+        )
+    scope.db.add(
+        AnswerRating(
+            account_id=scope.account_id,
+            message_id=message_id,
+            user_id=scope.user.id,
+            rating=body.rating,
+            stars=body.stars,
+            reasons=body.reasons or None,
+            comment=body.comment,
+        )
+    )
+    scope.db.commit()
+    return OkOut(ok=True)

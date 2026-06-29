@@ -8,3 +8,4 @@ storage/
 *-key.json
 *_key.json
 .pytest_cache/
+dev_ui/

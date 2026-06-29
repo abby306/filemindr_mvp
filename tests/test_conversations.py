@@ -101,9 +101,11 @@ def test_chat_writes_retrieval_trace(seeded_account, monkeypatch) -> None:
     def fake_synthesize(query, account_id, *, history=None, db=None, **kw):
         return SynthesisResult(
             query=query, answer="grounded answer", supported=True,
-            intent="lexical", searches=["follow-up q"],
+            intent="lexical", searches=["follow-up q"], escalated=True,
             citations=[Citation(fact_id=uuid.uuid4(), document_id=doc_id,
                                 title="Doc", page=3)],
+            candidate_facts=[{"id": "f1", "text": "a candidate fact"}],
+            plan={"vector": 5, "corpus_documents": 13},
             prompt_tokens=11, completion_tokens=7, latency_ms=42,
         )
 
@@ -119,6 +121,10 @@ def test_chat_writes_retrieval_trace(seeded_account, monkeypatch) -> None:
         assert trace.prompt_tokens == 11 and trace.completion_tokens == 7
         assert trace.latency_ms == 42
         assert trace.retrieval_plan["searches"] == ["follow-up q"]
+        assert trace.retrieval_plan["escalated"] is True
+        assert trace.retrieval_plan["vector"] == 5  # merged from result.plan
+        assert trace.candidates == [{"id": "f1", "text": "a candidate fact"}]
+        assert trace.context_sent["corpus_documents"] == 13
         assert trace.citations[0]["document_id"] == str(doc_id)
         assert trace.citations[0]["page"] == 3
 

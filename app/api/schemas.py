@@ -11,7 +11,7 @@ import datetime as dt
 import uuid
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentOut(BaseModel):
@@ -103,3 +103,14 @@ class MessageOut(BaseModel):
     role: str
     content: str | None
     created_at: dt.datetime
+
+
+class MessageRatingIn(BaseModel):
+    rating: Literal["up", "down"]
+    stars: int | None = Field(default=None, ge=1, le=5)
+    reasons: list[str] | None = None
+    comment: str | None = None
+
+
+class OkOut(BaseModel):
+    ok: bool

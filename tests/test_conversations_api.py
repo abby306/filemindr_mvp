@@ -192,3 +192,46 @@ def test_list_messages_foreign_conversation_404(client, seeded_account, monkeypa
         headers=_headers(seeded_account, account="personal_id"),
     )
     assert res.status_code == 404
+
+
+def _stub_synthesize_iter(monkeypatch, *, answer="streamed answer", supported=True):
+    """Patch the streaming core to emit a fixed event sequence + final result."""
+    def fake_iter(query, account_id, *, history=None, db=None, document_ids=None):
+        yield {"type": "intent", "intent": "semantic"}
+        yield {"type": "searching", "query": "vat", "found": 1}
+        yield {"type": "result", "result": SynthesisResult(
+            query=query, answer=answer, supported=supported, intent="semantic")}
+    monkeypatch.setattr("app.services.synthesis.synthesize_iter", fake_iter)
+
+
+def test_message_stream_emits_events_and_persists(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize_iter(monkeypatch)
+    headers = _headers(seeded_account)
+    cid = client.post("/api/v1/conversations", headers=headers).json()["id"]
+
+    res = client.post(
+        f"/api/v1/conversations/{cid}/messages/stream", headers=headers,
+        json={"content": "what is the vat?"},
+    )
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    body = res.text
+    for frame in ("event: intent", "event: searching", "event: done"):
+        assert frame in body
+    assert "streamed answer" in body
+
+    with SessionLocal() as db:
+        msgs = db.query(Message).filter_by(conversation_id=uuid.UUID(cid)).all()
+        assert {m.role for m in msgs} == {"user", "assistant"}
+        assert db.query(RetrievalTrace).join(
+            Message, Message.id == RetrievalTrace.message_id
+        ).filter(Message.conversation_id == uuid.UUID(cid)).count() == 1
+
+
+def test_message_stream_unknown_conversation_404(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize_iter(monkeypatch)
+    res = client.post(
+        f"/api/v1/conversations/{uuid.uuid4()}/messages/stream",
+        headers=_headers(seeded_account), json={"content": "hi"},
+    )
+    assert res.status_code == 404

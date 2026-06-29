@@ -29,7 +29,7 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy import text as sql_text
-from sqlalchemy.dialects.postgresql import ENUM, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ARRAY, ENUM, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -64,6 +64,7 @@ event_stage_enum = _pg_enum(
 )
 event_status_enum = _pg_enum("started", "succeeded", "failed", name="event_status")
 message_role_enum = _pg_enum("user", "assistant", name="message_role")
+rating_value_enum = _pg_enum("up", "down", name="rating_value")
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
@@ -353,4 +354,30 @@ class RetrievalTrace(Base):
     prompt_tokens: Mapped[int | None] = mapped_column(Integer)
     completion_tokens: Mapped[int | None] = mapped_column(Integer)
     latency_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+
+
+class AnswerRating(Base):
+    """User feedback on an assistant answer (up/down, optional stars/reasons/comment).
+
+    Linked to the rated message (and thus its retrieval trace), so feedback can be
+    correlated with what the agent retrieved. Account-scoped.
+    """
+
+    __tablename__ = "answer_ratings"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    rating: Mapped[str] = mapped_column(rating_value_enum, nullable=False)
+    stars: Mapped[int | None] = mapped_column(Integer)
+    reasons: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+    comment: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
