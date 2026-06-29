@@ -2,7 +2,9 @@
 
 > **Purpose:** a self-contained handoff for the next agent/session. Read this before touching code so you don't have to re-traverse the whole repo. Update it at the end of each development cycle.
 >
-> **Last updated:** 2026-06-28 · after **Phase 4 + pre-Phase-5 cleanup pass** (resilience, re-drive, concurrency, streaming upload, native-PDF bboxes, eval scaffold) · branch `main` (commits pending) · prior push at `dc6e73e` (`github.com/abby306/filemindr_mvp`).
+> **Last updated:** 2026-06-29 · after **Phase 5 service layer** + the **chat HTTP surface** (conversation endpoints + `retrieval_traces` writes + document-scoped chat) — over hybrid retrieval (intent router + structured/lexical/vector + RRF), **cross-encoder reranking**, **agentic corpus-aware synthesis** (Gemini 2.5 Flash + tools), and **conversation memory** · branch `main` (commits pending) · prior push at `462a72c`.
+>
+> **Verified on a real 13-doc corpus** (`scripts/seed_corpus.py` → live OCR/DeepSeek/bge): `doc_recall 1.00` on the gold set; live multi-turn chat answers accurate with citations and working "it"-style follow-ups. **145 tests passing, offline.**
 
 ---
 
@@ -22,14 +24,15 @@ Authoritative design docs live in [`agent_guide/`](agent_guide/): `PRD.md` → `
 | 2 — Ingest + OCR routing | ✅ Done | upload, dedup, storage, OCR pipeline → `ocr_done` |
 | 3 — Extraction | ✅ Done | DeepSeek card + atomic facts → `extracted`/`needs_review`; card API |
 | 4 — Embeddings/index | ✅ Done | bge-base embeds facts+summary → `indexed`; both HNSW stages indexed |
-| 5 — Retrieval + synthesis | ⏭️ **Next** | intent router, hybrid retrieval, grounded answers |
+| 5 — Retrieval + synthesis | ✅ **Service + chat HTTP done** | intent router + hybrid retrieval + RRF + reranker; agentic synthesis (Gemini Flash + tools); conversation memory; **chat endpoints + `retrieval_traces` writes**. **Remaining: SSE streaming + GPT-4o escalation + eval wiring** |
 | 6 — Frontend (Next.js) | ⏭️ Pending | Upload / Document view / Ask / Ratings |
 | 7 — Analytics + billing | ⏭️ Pending | usage counters, plans, quotas |
 
-- **Tests:** 101 passing (`pytest -q`). Run against the **live local Postgres**. Offline — Vision, DeepSeek, and the bge encoder are all mocked.
+- **Tests:** 157 passing (`pytest -q`). Run against the **live local Postgres**. Offline — Vision, DeepSeek, the bge encoder/reranker, **and the Gemini synthesis seam** are all mocked.
 - **Document pipeline status flow:** `received → ocr_done → extracted → indexed` (+ `failed` / `needs_review`). The full chain auto-runs on upload: OCR → extraction → embedding. **Every successfully-extracted doc is embedded** (so it is retrievable); confident docs reach **`indexed`**, low-confidence ones are embedded but **stay `needs_review`** (searchable + flagged for human review). Stuck/`failed` docs can be re-driven idempotently (`scripts/reprocess.py`).
 - **Resilience:** transient DeepSeek/Vision failures are retried (bounded backoff); a single failing chunk/page is skipped + recorded rather than failing the whole doc (only all-fail → `failed`). Per-chunk extraction and per-page OCR run with bounded concurrency. Uploads stream to disk with a size cap.
-- **DB:** 22 tables + `v_document_pipeline` view; migration `0002` adds the `documents.summary_embedding` HNSW index (both vector stages now indexed — see §6). Seed: 1 dev user, personal + company accounts, 14 system classes each, **0 documents**.
+- **DB:** 22 tables + `v_document_pipeline` view; migration `0002` adds the `documents.summary_embedding` HNSW index (both vector stages now indexed — see §6). Seed: 1 dev user, personal + company accounts, 14 system classes each, **0 documents** (load a corpus with `python -m scripts.seed_corpus`, which ingests `storage/samples/*` through the live pipeline).
+- **New dependency:** `google-genai` (Gemini SDK) — `pip install google-genai` (no `requirements.txt` in repo; deps live in the venv). Needs `GEMINI_API_KEY` in `.env` (set). Vision creds are now wired explicitly from settings (`config.vision_credentials_path` → `ocr._vision_client`) — image OCR no longer depends on an ambient `GOOGLE_APPLICATION_CREDENTIALS` env var.
 
 ---
 
@@ -70,7 +73,7 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
 
 ### `app/db/` — persistence
 - **`session.py`** — SQLAlchemy `engine` (psycopg, `pool_pre_ping`), `SessionLocal` sessionmaker, `get_db()` FastAPI dependency (yields + closes).
-- **`models.py`** — ORM mapped to the **existing** schema. **Never `create_all`** — Alembic owns DDL. `Base = DeclarativeBase`. Postgres enums via `_pg_enum(..., create_type=False)`. **Mapped tables:** `Account`, `User`, `AccountMember`, `Class`, `Document`, `DocumentClass`, `Entity`, `DocumentEntity`, `DocumentDate`, `TypedFact`, `DocumentFact` (has `embedding Vector(768)`; `fts` tsvector is DB-generated, not mapped), `ProcessingEvent` (bigserial PK; append-only pipeline log). **Not yet mapped** (add when their phase arrives): `conversations`, `messages`, `retrieval_traces`, `answer_ratings`, `usage_events`, `plans`, `subscriptions`, `invoices`, `usage_counters`. Membership relationships use `passive_deletes=True` (defer to DB `ON DELETE CASCADE`).
+- **`models.py`** — ORM mapped to the **existing** schema. **Never `create_all`** — Alembic owns DDL. `Base = DeclarativeBase`. Postgres enums via `_pg_enum(..., create_type=False)`. **Mapped tables:** `Account`, `User`, `AccountMember`, `Class`, `Document`, `DocumentClass`, `Entity`, `DocumentEntity`, `DocumentDate`, `TypedFact`, `DocumentFact` (has `embedding Vector(768)`; `fts` tsvector is DB-generated, not mapped), `ProcessingEvent` (bigserial PK; append-only pipeline log), **`Conversation`** + **`Message`** (chat memory; `message_role` enum `user|assistant`). **`RetrievalTrace`** (`retrieval_traces`; one row per answered message — intent/plan/citations/model/tokens/latency, JSONB cols). **Not yet mapped** (add when their phase arrives): `answer_ratings`, `usage_events`, `plans`, `subscriptions`, `invoices`, `usage_counters`. Membership relationships use `passive_deletes=True` (defer to DB `ON DELETE CASCADE`).
 
 ### `app/services/` — business logic
 - **`storage.py`** — raw file persistence. `compute_hash` (SHA-256); **`save_stream(stream, account_id, ext, *, max_bytes, storage_root?) → StoredFile`** streams a chunk-readable upload to a temp file, hashing **incrementally** (never buffering the whole body), raises **`FileTooLargeError`** the moment `max_bytes` is exceeded (temp cleaned up), then atomic-renames to the content-addressed path `STORAGE_DIR/<account_id>/<hash><ext>`. `get_storage_root()` is the single settings read (monkeypatched in tests).
@@ -99,19 +102,35 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
   - **Asymmetric encoding** (bge convention, matters for retrieval accuracy): `embed_passages(texts)` for indexing (no prefix); `embed_query(q)` for Phase-5 search (prepends `QUERY_INSTRUCTION`). Both go through `_encode` (the single compute seam, **`normalize_embeddings=True`** so cosine distance is exact) — tests stub it, never downloading the model. The model is a **thread-safe** lazy singleton (`_get_model` uses double-checked locking around `_load_model`), so concurrent first uploads load it once.
   - **`run_embedding(document_id, account_id)`** — background entry point: own session, account-scoped, idempotent (overwrites vectors in place). Embeds all `document_facts.text` → `embedding` and `documents.summary` → `summary_embedding`; status → `indexed`. A `needs_review` doc is still embedded (searchable) but **keeps its review flag** rather than flipping to `indexed`. Logs `processing_events(embedding, …)`; on exception sets `failed`. Re-indexable from `extracted`/`indexed`/`needs_review`.
 
+- **`retrieval.py`** — Phase-5 hybrid retrieval (no LLM). `classify_intent(query)` → `aggregate|lexical|metadata|semantic` (pure regex rules; ALL-CAPS proper nouns + `vat/tax` routing). Three retrievers, all account-scoped & optionally **scoped** (`document_ids` / `class_slug` via `_resolve_scope`): **vector two-stage** (`summary_embedding` HNSW shortlist → `document_facts.embedding` HNSW rank), **lexical** (FTS over `document_facts.fts` **plus** `typed_facts.value` / `entities.name` exact-match — exact ids/parties often live only there), **structured** (`typed_facts`/`dates`/`entities` from the most-relevant docs, ordered by doc-relevance then label-match priority; a typed fact whose label the query names is marked `exact` and fused as a high-weight source). Fused with intent-weighted **RRF** (`rrf_merge`), then **reranked** (`rerank=True` default). `retrieve(query, account_id, *, k, rerank, document_ids, class_slug) → RetrievalResult` (facts: `list[FactHit]`, doc_ids, plan). Pure helpers (`classify_intent`, `rrf_merge`) unit-tested; `embed_query` is the only model seam.
+- **`reranking.py`** — Phase-5 cross-encoder (`BAAI/bge-reranker-base`, local CPU, lazy thread-safe singleton). `rerank(query, hits, *, top_k)` **blends** cross-encoder relevance with the incoming RRF score: `0.4·CE + 0.6·fused` (both min-max normalized) — consensus-primary, because the small reranker is brittle (under-scores answers buried in a clause; can't read terse `label: value` text), so it *refines* but can't bury a strong-consensus fact. `_score` is the only seam (tests stub it).
+- **`catalog.py`** — Phase-5 document catalog (corpus awareness the agent *queries*, not a context dump). `find_documents(db, account_id, *, class_slug, name, about, uploaded_after, uploaded_before, limit)` → `CatalogDoc[]` (resolves human refs: class / remembered name / upload window / semantic `about` via `summary_embedding`). `corpus_overview(db, account_id)` → bounded orientation (counts, by-class, date range; inlines the **full** listing when `total ≤ SMALL_CORPUS=30`, else stats + recent). Considers only **searchable** docs (`indexed`/`needs_review`).
+- **`synthesis.py`** — Phase-5 **agentic** synthesis (Gemini 2.5 Flash). `synthesize(query, account_id, *, db, history, model, max_steps, document_ids) → SynthesisResult` (answer, `supported`, `citations`, intent, searches, documents_looked_up, tokens, latency). Seeds the model with a corpus overview + initial candidate pool + conversation `history`, then loops (bounded `_MAX_STEPS=5`, forced `finish` on the last turn) with three tools: **`find_documents`**, **`search`** (scoped via `document_ref`/`class`), **`finish`**. Grounding by construction: short ids (`f3`/`d2`) via `_FactRegistry`/`_DocRegistry`; cited ids validated → real `document_id`/`page`/`bbox`; hallucinated ids dropped; `supported=false` is the honest "not in your docs" path; `function_calling` mode ANY. **`_gemini_turn` is the only network seam** (tests stub it). For small corpora the inlined overview means `find_documents`/`search` often don't need to fire — they activate at scale. **`document_ids`** pins the initial `retrieve` (and tells the agent it's scoped) — the path behind the message endpoint's `scope="document"`.
+- **`conversations.py`** — Phase-5 conversation memory. `create_conversation`, `add_message` (account-scoped, sets explicit `created_at` so same-transaction user→assistant order is deterministic — uuid pks aren't monotonic), `load_history(... limit=12)` (windowed, oldest-first), **`record_trace(db, account_id, message_id, result)`** (one `retrieval_traces` row from a `SynthesisResult`), and **`chat(account_id, user_message, *, conversation_id, user_id, document_ids, db)`** → `(SynthesisResult, conversation_id, assistant_message_id)`: loads windowed history → `synthesize(history=…, document_ids=…)` → persists both turns + the trace (atomic). Creates the conversation if none.
+
 ### `app/api/` — HTTP layer
 - **`schemas.py`** — Pydantic response models. `DocumentOut` (id, status, source, original_filename, mime_type, byte_size, title, summary, language, page_count, created_at — `from_attributes=True`) is the light list/ingest view. `DocumentListOut` (items + next_cursor). **`DocumentCardOut`** (extends `DocumentOut`) adds `classes` (`ClassCardOut` slug/name/confidence), `entities` (`EntitiesCardOut` people/orgs/places), `dates` (`DateCardOut`), `typed_facts` (`TypedFactCardOut`; `value_type`→`type`), and `fact_count` — returned by the document-detail endpoint.
 - **`documents.py`** — `APIRouter(prefix="/api/v1")`. Endpoints:
   - `POST /documents` — multipart upload. `_resolve_mime` (header → extension fallback); 415 if unsupported. **Streams** the upload via `save_stream` in a threadpool with `max_upload_mb` cap → **413** if over cap, **400** if empty. **Dedup** on `(account_id, file_hash)` (returns existing with **200**); else insert `Document` at `received`, `record_event(received, succeeded)`, commit, then **schedule `ocr.run_ocr` as a `BackgroundTask`**, return **201**.
   - `GET /documents` — account-scoped list, newest first, `status` filter, **keyset pagination** (opaque base64 cursor of `(created_at, id)`), `limit` 1–200.
   - `GET /documents/{id}` — account-scoped detail returning the **full `DocumentCardOut`** (`_build_card` assembles classes/entities/dates/typed_facts/`fact_count` via scoped queries); **404** for another account's doc. Card sections are empty until extraction runs.
+- **`conversations.py`** — `APIRouter(prefix="/api/v1")`, chat surface (thin wrappers over `services/conversations`). Endpoints:
+  - `POST /conversations` → **201** `{id}` (scoped to the active account).
+  - `POST /conversations/{id}/messages` — one agentic turn over `conversations.chat`. Body `{content, scope?:"account"|"document", document_id?}`; `scope="document"` validates `document_id` (**400** if missing, **404** if not in account) and pins retrieval to it. Returns `{message_id, answer, citations[], supported}`; **404** for an unknown/foreign conversation (catches the service `ValueError`).
+  - `GET /conversations/{id}/messages` — account-scoped full history (oldest-first `MessageOut[]`); **404** for an unknown/foreign conversation.
+- **`schemas.py`** also has chat models: `ConversationOut`, `MessageCreate`, `CitationOut`, `MessageAnswerOut`, `MessageOut`.
 
 ### `app/main.py`
-FastAPI app. `app.include_router(documents_router)`. `GET /health` (unauth; `SELECT 1` DB check → 200/503). `GET /api/v1/me` (auth+scoping demo, returns user+account). **Note:** FastAPI 0.138 represents included routers as a lazy `_IncludedRouter` in `app.routes`; verify routes via `app.openapi()["paths"]`, not by scanning `app.routes`.
+FastAPI app. `app.include_router(documents_router)` + `app.include_router(conversations_router)`. `GET /health` (unauth; `SELECT 1` DB check → 200/503). `GET /api/v1/me` (auth+scoping demo, returns user+account). **Note:** FastAPI 0.138 represents included routers as a lazy `_IncludedRouter` in `app.routes`; verify routes via `app.openapi()["paths"]`, not by scanning `app.routes`.
 
 ### `scripts/`
 - **`seed.py`** — idempotent `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.com`), personal + company accounts, memberships (both `owner`), and the 14 system classes per account. Prints the dev-user UUID (bearer token) + account UUIDs.
 - **`reprocess.py`** — `python -m scripts.reprocess [--statuses ..] [--account ..]`. Sweeps stuck/`failed` docs via `reprocessing.reprocess_stuck`.
+- **`seed_corpus.py`** — `python -m scripts.seed_corpus [--account ..|--account-name ..]`. Ingests `storage/samples/*` through the **live** OCR→extraction→embedding chain into an account (default Personal); idempotent (dedups, re-drives non-terminal). Prints a `file → doc_id → status → fact_count` table. (`.pptx`/`.txt` are skipped — unsupported.)
+- **`retrieve.py`** — `python -m scripts.retrieve [--account ..] [--k N] "<query>"`. Prints intent + top-k facts (doc/page/score/source). The retrieval-only rating loop (no synthesis).
+- **`eval_retrieval.py`** — `python -m scripts.eval_retrieval [--k N] [--gold ..] [--doc-map ..]`. Scores live retrieval vs `eval/gold/seed.yaml`; auto-maps gold slugs → real doc UUIDs by token overlap (override with `--doc-map`). `answer_correctness` reads low until synthesis is wired into the eval; watch `doc_recall`/`fact_recall`.
+- **`ask.py`** — `python -m scripts.ask [--account ..] "<query>"`. One-shot **agentic** answer (live Gemini): answer + supported + citations + searches/lookups + tokens.
+- **`chat.py`** — `python -m scripts.chat [--account ..] [--conversation <id>]`. Interactive multi-turn chat with memory (live Gemini); prints the conversation id to resume later.
 
 ### `eval/` — retrieval eval harness (built pre-Phase-5; see `eval/README.md`)
 - **`schema.py`** — `GoldQuery`/`RetrievedAnswer`; `load_gold(path)` (YAML).
@@ -119,7 +138,7 @@ FastAPI app. `app.include_router(documents_router)`. `GET /health` (unauth; `SEL
 - **`gold/seed.yaml`** — 8 illustrative queries across the 4 intents, grounded in the Phase-3/4 sample docs (`expected_doc_ids` are slugs → map to real UUIDs in a seeded eval corpus).
 - **`run.py`** — `python -m eval.run [--k N] [--gold path]`; scores a `retrieve(query)` callable, ships a fixture stub. **Phase 5 wiring point** documented in the README.
 
-### `tests/` (101 tests, all live-DB; every network/model seam mocked)
+### `tests/` (157 tests, all live-DB; every network/model seam mocked)
 - **`conftest.py`** — `db` fixture (session, **rolls back**); `seeded_account` fixture (commits a throwaway user + personal/company accounts + memberships, yields their ids, cascade-deletes on teardown).
 - **`test_config.py`** — settings load, caching, env overrides, defaults.
 - **`test_db.py`** — engine connects, pgvector present, `get_db` yields a session.
@@ -134,6 +153,12 @@ FastAPI app. `app.include_router(documents_router)`. `GET /health` (unauth; `SEL
 - **`test_eval.py`** — scorer units (recall/correctness/`None`-aggregation/missing-result/bad-type) + runner end-to-end vs the stub.
 - **`test_embeddings.py`** (10 tests) — passage/query asymmetry (`embed_query` prefixes `QUERY_INSTRUCTION`, `embed_passages` doesn't, empty no-op); live-DB `run_embedding` (facts + summary get 768-vecs, status → `indexed`); no-facts doc (summary only); idempotent re-index; **`needs_review` embedded but flag preserved**; unindexable status no-op; account isolation; **extraction→embedding chain** reaches `indexed` (and embeds a `needs_review` doc while keeping the flag); **thread-safe singleton load** (8 threads → one load). Encoder stubbed via `embed_passages`/`_encode` → no model download.
 - **`test_extraction.py`** — `parse_extraction` (lenient enums/dates, numeric coercion + clamp, code-fence stripping); **`_bbox_for_fact`** matches native-PDF blocks; **`chunk_pages`** / **`merge_results`** (split/union/dedup, chunk-order merge); live-DB fan-out (tables written, unknown slug dropped, org deduped); **idempotent re-run**; **`needs_review` routing**; **account isolation**; **multi-chunk run** (all pages covered); **partial tolerance** (one chunk fails → partial card; all fail → `failed`); card endpoint. LLM + encoder mocked → fully offline.
+- **`test_retrieval.py`** — `classify_intent` matrix; `rrf_merge` (weighted order, zero-weight exclusion, prefer-citable-copy); live-DB `retrieve` (vector ranks aligned fact first, lexical exact-id, aggregate surfaces typed fact, lexical entity-name match, aggregate label priority, **document scoping**, account isolation). `embed_query` stubbed; deterministic RRF tests pass `rerank=False`.
+- **`test_reranking.py`** — `rerank` reorders/respects top_k/empty no-op/passes (query,fact) pairs; live-DB `retrieve(rerank=True)` integration (blend promotes the right fact). `_score` stubbed.
+- **`test_synthesis.py`** — agentic loop with `_gemini_turn` **and** `retrieve` stubbed: finish-now-with-citation, search-then-finish, hallucinated-citation dropped, unsupported answer, bounded-loop forced finish, token accumulation. (`catalog.corpus_overview` stubbed in the `no_db` fixture.)
+- **`test_catalog.py`** — `find_documents` by class / name / upload window / semantic `about` (embed_query stubbed); `corpus_overview` small-corpus inlining + excludes unsearchable.
+- **`test_conversations.py`** — create/history roundtrip, windowed + ordered, account-scoped, foreign-account rejected; **`chat`** persists both turns + passes prior history, **writes a `retrieval_traces` row**, and **threads `document_ids`** (synthesize stubbed).
+- **`test_conversations_api.py`** — chat HTTP surface (synthesize stubbed): create (201 + auth gate); `POST messages` returns answer/citations/supported + persists messages + **writes the trace row**; unknown/foreign conversation → 404; `scope="document"` (400 no id / 404 bad doc / threads `document_ids` for a real doc); `GET messages` history + account isolation.
 
 ---
 
@@ -148,7 +173,15 @@ FastAPI app. `app.include_router(documents_router)`. `GET /health` (unauth; `SEL
 6. **Chained on `extracted`** → `run_embedding(document_id, account_id)`: bge-base embeds every `document_facts.text` → `embedding` and `summary` → `summary_embedding`; status → `indexed`; log `processing_events(embedding, succeeded)`.
 7. `GET /api/v1/documents` (light list) / `GET /api/v1/documents/{id}` (full card) to read back (account-scoped).
 
-**Chat (Flow B):** not built yet (Phase 5).
+**Chat (Flow B, now exposed over HTTP):**
+1. `conversations.chat(account_id, user_message, conversation_id?)` → creates/loads the conversation, reads **windowed history** (last 12 turns).
+2. `synthesis.synthesize(query, account_id, history=…)`:
+   a. `catalog.corpus_overview` (bounded; inlines the full catalog when ≤30 docs) + initial `retrieval.retrieve(query, k=12)` seed the candidate pool (facts get short ids `f#`, docs `d#`).
+   b. Agentic loop (Gemini Flash, ≤5 turns, forced `finish` last): the model may `find_documents(...)` to resolve a reference, `search(query, document_ref?/class?)` for more (scoped) facts, then `finish(answer, cited_fact_ids, supported)`.
+   c. Citations validated against the registry → real `document_id`/`page`; `supported=false` when the corpus lacks the answer.
+3. Persist user + assistant messages + a `retrieval_traces` row; return `SynthesisResult`. **Drivers:** the chat endpoints (`POST /conversations`, `POST /conversations/{id}/messages`, `GET /conversations/{id}/messages`), `python -m scripts.chat` (interactive), `python -m scripts.ask` (one-shot). **Not yet:** SSE streaming, GPT-4o escalation, eval wiring.
+
+**Eval (retrieval quality):** `python -m scripts.eval_retrieval` scores live retrieval vs the gold set; `python -m scripts.retrieve "<q>"` inspects ranked facts.
 
 ---
 
@@ -164,25 +197,31 @@ FastAPI app. `app.include_router(documents_router)`. `GET /health` (unauth; `SEL
 |---|---|---|---|
 | OCR | Google Vision | `GOOGLE_APPLICATION_CREDENTIALS` | ✅ live (Phase 2) |
 | Extraction (cheap structured pass) | **DeepSeek** `deepseek-chat` (OpenAI-compatible client, custom `base_url`) | `DEEPSEEK_API_KEY` | ✅ live (Phase 3) |
-| Intent routing + standard synthesis | **Gemini 2.5 Flash** | `GEMINI_API_KEY` | key set, not wired |
-| Hard synthesis / low-confidence re-check | **GPT-4o** | `OPENAI_API_KEY` | key set, not wired |
+| Intent routing | rules (regex) | — | ✅ live (Phase 5); pure, no LLM |
+| Standard synthesis (agentic) | **Gemini 2.5 Flash** (`google-genai`) | `GEMINI_API_KEY` | ✅ live (Phase 5) |
+| Hard synthesis / low-confidence re-check | **GPT-4o** | `OPENAI_API_KEY` | key set, **not wired** — escalation seam reserved |
+| Reranking | `BAAI/bge-reranker-base` (local CPU) | — | ✅ live (Phase 5); blended w/ RRF (α=0.4) |
 | Embeddings | `bge-base-en-v1.5` (local, 768-d, CPU) | — | ✅ live (Phase 4); `sentence-transformers`/`torch` installed |
 
 Cost discipline: cheap model for extraction, strong only for hard synthesis, local embeddings.
 
 ---
 
-## 8. Next steps — Phase 5 (Retrieval + synthesis)
+## 8. Next steps
 
-Goal: answer a user query by retrieving against the now-indexed structured data, with citations. Per `TECH_SPEC.md` §Retrieval:
-1. **Intent router** (cheap model / rules) → `metadata | semantic | hybrid | aggregate`. New `app/services/retrieval.py`.
-2. **Structured-first** (no LLM): aggregate/metadata queries hit `typed_facts` (`value_numeric` for sums/compares), `document_dates`, `entities`, `document_classes` directly. *This is where "how much did I spend" belongs — not vector search* (the bge smoke confirmed vague amount queries mis-rank against item names).
-3. **Lexical**: Postgres FTS over `document_facts.fts` (GIN, already generated) for exact ids/names.
-4. **Vector, two-stage**: `embed_query(q)` → `documents.summary_embedding` (HNSW) picks candidate docs → `document_facts.embedding` (HNSW) ranks facts within them. Use `embed_query` (instruction-prefixed), **not** `embed_passages`.
-5. **Rerank** merged candidates (cross-encoder, e.g. bge-reranker) → top facts.
-6. **Synthesize** (Gemini 2.5 Flash standard / GPT-4o hard) over top facts + metadata → answer with **mandatory citations** (each fact already carries `document_id`/`page`/`bbox`).
-7. **Persist + stream**: map `conversations`/`messages`/`retrieval_traces` ORM tables; write a trace per answer; emit the pipeline stages as SSE events (intent → shortlist → reading → tokens → citations) — the foundation for the real-time "subprocess" UX and shortlist-confirmation/guided-narrowing.
-8. Wire `gemini_api_key` (field exists) into a Gemini client; add a model-routing seam (cheap vs. hard synthesis). Mock all LLM/encoder seams in tests.
+**Phase 5 — DONE at the service layer** (all in `app/services/`, all mocked in tests): intent router + structured-first + lexical (FTS + typed-fact/entity exact match) + two-stage vector + RRF (`retrieval.py`); cross-encoder rerank blended with RRF (`reranking.py`); agentic corpus-aware synthesis with citations + `supported` flag (`synthesis.py`); document catalog / `find_documents` (`catalog.py`); conversation memory + `chat()` (`conversations.py`). Validated on a real 13-doc corpus.
+
+**Phase 5 — DONE (chat HTTP surface, PR1):**
+1. ✅ **Endpoints** (`app/api/conversations.py`, per `API_CONTRACTS.md`): `POST /conversations`, `POST /conversations/{id}/messages` (calls `conversations.chat`, supports `scope="document"`), `GET /conversations/{id}/messages`. Thin wrappers over the services; router wired in `main.py`.
+2. ✅ **`retrieval_traces`**: `RetrievalTrace` ORM mapped (no migration — table pre-exists); `conversations.record_trace` writes one row per answered message inside `chat()`'s transaction.
+
+**Phase 5 — REMAINING (the HTTP/UX surface):**
+3. **SSE streaming**: emit the agent's steps as events (intent → find_documents → searching → reading → answer/citations) — the "subprocess" UX. Plan: dedicated `POST /conversations/{id}/messages/stream`; refactor the `synthesis.py` loop to emit step events via an optional callback fed to a `StreamingResponse`.
+4. **Hard-synthesis escalation**: wire GPT-4o (key set) for low-confidence / `supported=false` re-checks — the seam (`model=` param) exists.
+5. **Eval**: wire `synthesize` into `eval/` so `answer_correctness` is measured (currently retrieval-only); refresh `eval/gold/seed.yaml` to the real corpus UUIDs.
+6. **Fuller traces (debt)**: `candidates`/`reranked`/`context_sent` trace cols are null for now — enrich `SynthesisResult` to carry the candidate fact list + `RetrievalResult.plan` to populate them.
+
+**Phase 6 — Frontend (Next.js):** Upload / Document view / Ask (the chat UX) / Ratings. The conversation model, tool/event vocabulary, and document-reference affordances are now locked in code so the frontend won't need backend rework.
 
 ---
 
@@ -195,6 +234,14 @@ Goal: answer a user query by retrieving against the now-indexed structured data,
 - **Doc-level summary = first chunk's summary** — for chunked (long) docs, `merge_results` takes the first non-empty chunk summary rather than synthesizing across chunks. Fine for now (page-1 intro is usually representative); a dedicated summary-merge pass would improve long-doc summaries.
 - **Extraction validated on real docs** (Phase 3) via a throwaway smoke harness over `storage/samples/` (3 PDFs + 2 receipt JPEGs) against **live Vision + DeepSeek** — receipts/contract/reports all classified + extracted accurately; reports in `storage/samples/reports/` (gitignored). Quality is good; sparse pages (code listings, rubrics) legitimately yield no atomic facts.
 - **List endpoint vs. contract** — `GET /documents` returns light `DocumentOut` items (not full cards) to avoid N+1; `API_CONTRACTS.md` shows `[DocumentCard]`. Detail returns the full card. Fine for now; batch-load if the list view needs card data.
-- **`gemini_api_key` field added** (Phase 3) but **Gemini still not wired** — that's Phase 5 (intent routing + synthesis).
+- **Gemini wired (Phase 5)** — `gemini_api_key` now drives the agentic synthesis client in `synthesis.py` (`google-genai`, model `gemini-2.5-flash`). Intent routing is rules-based (no LLM), not Gemini.
 - **Auth is dev-grade** (bearer = user UUID). Replace at the `get_current_user` seam before any real deployment; consider RLS as defence-in-depth alongside `AccountScope`. *(Owner doing security/auth deliberately later.)*
-- **Eval gold set is illustrative scaffold** — `eval/gold/seed.yaml` `expected_doc_ids` are slugs, not real UUIDs; the runner uses a fixture stub. Phase 5 seeds an eval corpus and wires `retrieve(query, account_id)` (see `eval/README.md`).
+- **Eval gold set is illustrative scaffold** — `eval/gold/seed.yaml` `expected_doc_ids` are slugs; `scripts/eval_retrieval.py` auto-maps them to real UUIDs by token overlap. `answer_correctness` isn't measured yet (synthesis not wired into the eval). Refresh the gold set to the real corpus and wire `synthesize` to close that.
+- **Cold-start latency** — the first retrieval/answer after a restart loads the bge embedder **and** the bge-reranker (~30s observed); subsequent queries ~2.5–3s. Both are lazy CPU singletons. Consider a warmup call on boot, or GPU, if latency matters.
+- **Reranker is brittle (`bge-reranker-base`)** — it under-scores answers buried in a clause (scored *"…yielding a gross margin of ~75-80%"* ≈0.002) and can't read terse `label: value` structured text. Mitigated by the **consensus-primary blend** (α=0.4) + the `exact`-label boost in `retrieval.py`. If you want better, try `bge-reranker-v2-m3` (larger, slower) and re-tune α.
+- **`find_documents`/`search` tools rarely fire on small corpora** — by design: with ≤30 docs the corpus overview inlines the whole catalog, so the agent already has what it needs. They activate at scale (stats-only overview). Don't mistake "didn't search" for "broken".
+- **Citation display** — distinct facts from the same doc+page surface as repeated citations (e.g. moodump p7 ×3). They're genuinely different facts; the API/frontend should **group citations by document** for display.
+- **"What is X about?" returns front-matter** — overview/abstract queries over a long doc (e.g. the thesis) surface TOC/dedication facts. This is an *extraction* artifact (too many low-value front-matter facts) + the reranker rewarding literal "thesis includes…". Future fix: prefer the document **summary** (or unused `documents.summary_long`) for overview-intent queries.
+- **Vision credentials fixed this session** — `vision.ImageAnnotatorClient()` used to rely on an ambient `GOOGLE_APPLICATION_CREDENTIALS`; now `ocr._vision_client` builds explicit creds from `config.vision_credentials_path` (falls back to ADC if the file is missing). Image OCR (the receipt JPEGs) failed before this and were re-driven.
+- **No `requirements.txt`** — dependencies live only in the venv. `google-genai` was added this session via `pip install`. Consider freezing a manifest before the next environment rebuild.
+- **Conversation history is a fixed window (12 turns), unsummarized** — accepted for now (the user's own refinement is the correction mechanism). Revisit with summarization if long chats need to retain earlier context.

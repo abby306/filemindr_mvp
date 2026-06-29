@@ -14,10 +14,11 @@ Schema, environment, and implementation detail. Living document — add/adjust c
 ## Runtime models
 | Role | Model | Notes |
 |---|---|---|
-| OCR | Google Vision | fallback when no PDF text layer; images always |
-| Extraction | GPT-4o-mini / DeepSeek | cheap structured-output pass |
-| Synthesis | GPT-4o | answers + low-confidence re-checks |
-| Embeddings | `bge-base-en-v1.5` | local, **768-dim**, CPU, zero per-token cost |
+| OCR | Google Vision | ✅ live (Phase 2); fallback when no PDF text layer; images always |
+| Extraction | DeepSeek `deepseek-chat` | ✅ live (Phase 3); cheap structured-output pass (OpenAI-compatible client) |
+| Synthesis | **Gemini 2.5 Flash** | ✅ live (Phase 5); agentic loop w/ tools + citations (`google-genai`). GPT-4o reserved as hard/low-confidence escalation (seam exists; not yet wired) |
+| Reranking | `BAAI/bge-reranker-base` | ✅ live (Phase 5); local cross-encoder, CPU. Blended with RRF (α=0.4, consensus-primary) — see `reranking.py` |
+| Embeddings | `bge-base-en-v1.5` | ✅ live (Phase 4); local, **768-dim**, CPU, zero per-token cost |
 
 > Vector columns are `vector(768)`. If the embedding model changes, the new model must also output 768 dims — otherwise re-embed the corpus and rebuild the HNSW index.
 

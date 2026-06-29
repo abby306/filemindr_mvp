@@ -64,6 +64,12 @@ class Settings(BaseSettings):
         path = Path(self.storage_dir)
         return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
 
+    @property
+    def vision_credentials_path(self) -> Path:
+        """`google_application_credentials` resolved to an absolute project path."""
+        path = Path(self.google_application_credentials)
+        return path if path.is_absolute() else (PROJECT_ROOT / path).resolve()
+
 
 @lru_cache
 def get_settings() -> Settings:

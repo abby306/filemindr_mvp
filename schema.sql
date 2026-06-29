@@ -107,6 +107,9 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 CREATE INDEX IF NOT EXISTS documents_account_status_idx  ON documents (account_id, status);
 CREATE INDEX IF NOT EXISTS documents_account_created_idx ON documents (account_id, created_at DESC);
+-- Stage 1 of two-stage vector retrieval: pick candidate documents by summary.
+CREATE INDEX IF NOT EXISTS documents_summary_embedding_hnsw
+  ON documents USING hnsw (summary_embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
 CREATE TABLE IF NOT EXISTS document_classes (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),

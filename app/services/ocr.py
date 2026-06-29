@@ -212,7 +212,22 @@ def _vision_client():
     if _vision_singleton is None:
         from google.cloud import vision
 
-        _vision_singleton = vision.ImageAnnotatorClient()
+        from app.core.config import get_settings
+
+        # Wire the service-account file from settings explicitly. Relying on
+        # ambient Application Default Credentials fails when the path lives in
+        # `.env` (pydantic loads it into Settings, not os.environ). Fall back to
+        # ADC only if the configured file is missing.
+        creds_path = get_settings().vision_credentials_path
+        if creds_path.is_file():
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_file(
+                str(creds_path)
+            )
+            _vision_singleton = vision.ImageAnnotatorClient(credentials=credentials)
+        else:
+            _vision_singleton = vision.ImageAnnotatorClient()
     return _vision_singleton
 
 

@@ -1,0 +1,194 @@
+"""HTTP chat surface: conversation creation, messaging, history, and traces.
+
+`synthesize` is stubbed (no Gemini), so these verify the endpoints' wiring: auth +
+account scoping, the thin wrapper over `conversations.chat`, document-scope
+validation, the persisted `retrieval_traces` row, and history replay.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.db.models import Document, Message, RetrievalTrace
+from app.db.session import SessionLocal
+from app.main import app
+from app.services.synthesis import Citation, SynthesisResult
+
+
+@pytest.fixture
+def client() -> TestClient:
+    return TestClient(app)
+
+
+def _headers(seeded_account, *, account="personal_id") -> dict:
+    return {
+        "Authorization": f"Bearer {seeded_account['user_id']}",
+        "X-Account-Id": str(seeded_account[account]),
+    }
+
+
+def _stub_synthesize(monkeypatch, *, capture=None, **fields):
+    """Patch the synthesis seam to return a fixed result (optionally capturing kwargs)."""
+    def fake(query, account_id, *, history=None, db=None, document_ids=None, **kw):
+        if capture is not None:
+            capture["document_ids"] = document_ids
+        defaults = dict(query=query, answer="grounded answer", supported=True)
+        defaults.update(fields)
+        return SynthesisResult(**defaults)
+
+    monkeypatch.setattr("app.services.synthesis.synthesize", fake)
+
+
+def test_create_conversation(client, seeded_account) -> None:
+    res = client.post("/api/v1/conversations", headers=_headers(seeded_account))
+    assert res.status_code == 201
+    assert uuid.UUID(res.json()["id"])  # a real uuid
+
+
+def test_create_conversation_requires_auth(client) -> None:
+    assert client.post("/api/v1/conversations").status_code == 401
+
+
+def test_post_message_returns_answer_and_writes_trace(client, seeded_account, monkeypatch) -> None:
+    doc_id = uuid.uuid4()
+    fact_id = uuid.uuid4()
+    _stub_synthesize(
+        monkeypatch, answer="the total is $1240", supported=True, intent="aggregate",
+        prompt_tokens=20, completion_tokens=9, latency_ms=33,
+        citations=[Citation(fact_id=fact_id, document_id=doc_id, title="Invoice", page=2)],
+    )
+    headers = _headers(seeded_account)
+    convo_id = client.post("/api/v1/conversations", headers=headers).json()["id"]
+
+    res = client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=headers,
+        json={"content": "what is the total?"},
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["answer"] == "the total is $1240"
+    assert body["supported"] is True
+    assert body["citations"][0]["document_id"] == str(doc_id)
+    assert body["citations"][0]["page"] == 2
+    message_id = body["message_id"]
+
+    with SessionLocal() as db:
+        msgs = db.query(Message).filter_by(conversation_id=uuid.UUID(convo_id)).all()
+        assert {m.role for m in msgs} == {"user", "assistant"}
+        trace = db.query(RetrievalTrace).filter_by(message_id=uuid.UUID(message_id)).one()
+        assert trace.intent == "aggregate"
+        assert trace.answer == "the total is $1240"
+        assert trace.prompt_tokens == 20
+
+
+def test_post_message_unknown_conversation_404(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch)
+    res = client.post(
+        f"/api/v1/conversations/{uuid.uuid4()}/messages",
+        headers=_headers(seeded_account),
+        json={"content": "hello"},
+    )
+    assert res.status_code == 404
+
+
+def test_post_message_foreign_conversation_404(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch)
+    # Conversation created under the company account...
+    convo_id = client.post(
+        "/api/v1/conversations", headers=_headers(seeded_account, account="company_id")
+    ).json()["id"]
+    # ...is invisible from the personal account.
+    res = client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=_headers(seeded_account, account="personal_id"),
+        json={"content": "hello"},
+    )
+    assert res.status_code == 404
+
+
+def test_document_scope_requires_document_id(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch)
+    headers = _headers(seeded_account)
+    convo_id = client.post("/api/v1/conversations", headers=headers).json()["id"]
+    res = client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=headers,
+        json={"content": "hi", "scope": "document"},
+    )
+    assert res.status_code == 400
+    assert res.json()["detail"]["code"] == "document_id_required"
+
+
+def test_document_scope_unknown_document_404(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch)
+    headers = _headers(seeded_account)
+    convo_id = client.post("/api/v1/conversations", headers=headers).json()["id"]
+    res = client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=headers,
+        json={"content": "hi", "scope": "document", "document_id": str(uuid.uuid4())},
+    )
+    assert res.status_code == 404
+
+
+def test_document_scope_threads_document_ids(client, seeded_account, monkeypatch) -> None:
+    capture: dict = {}
+    _stub_synthesize(monkeypatch, capture=capture)
+    headers = _headers(seeded_account)
+    convo_id = client.post("/api/v1/conversations", headers=headers).json()["id"]
+
+    with SessionLocal() as db:
+        doc = Document(
+            account_id=seeded_account["personal_id"], source="web_upload",
+            original_filename="f.pdf", file_hash=uuid.uuid4().hex,
+            storage_path="/tmp/f.pdf", status="indexed",
+        )
+        db.add(doc)
+        db.commit()
+        doc_id = doc.id
+
+    res = client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=headers,
+        json={"content": "what does it say?", "scope": "document", "document_id": str(doc_id)},
+    )
+    assert res.status_code == 200
+    assert capture["document_ids"] == [doc_id]
+
+    with SessionLocal() as db:
+        db.query(Document).filter_by(id=doc_id).delete()
+        db.commit()
+
+
+def test_list_messages_returns_history(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch, answer="answer one")
+    headers = _headers(seeded_account)
+    convo_id = client.post("/api/v1/conversations", headers=headers).json()["id"]
+    client.post(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=headers, json={"content": "question one"},
+    )
+
+    res = client.get(f"/api/v1/conversations/{convo_id}/messages", headers=headers)
+    assert res.status_code == 200
+    history = res.json()
+    assert [(m["role"], m["content"]) for m in history] == [
+        ("user", "question one"),
+        ("assistant", "answer one"),
+    ]
+
+
+def test_list_messages_foreign_conversation_404(client, seeded_account, monkeypatch) -> None:
+    _stub_synthesize(monkeypatch)
+    convo_id = client.post(
+        "/api/v1/conversations", headers=_headers(seeded_account, account="company_id")
+    ).json()["id"]
+    res = client.get(
+        f"/api/v1/conversations/{convo_id}/messages",
+        headers=_headers(seeded_account, account="personal_id"),
+    )
+    assert res.status_code == 404

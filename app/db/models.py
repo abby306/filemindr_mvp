@@ -63,6 +63,7 @@ event_stage_enum = _pg_enum(
     "received", "ocr", "extraction", "embedding", "indexing", name="event_stage"
 )
 event_status_enum = _pg_enum("started", "succeeded", "failed", name="event_status")
+message_role_enum = _pg_enum("user", "assistant", name="message_role")
 
 
 def _uuid_pk() -> Mapped[uuid.UUID]:
@@ -289,4 +290,67 @@ class ProcessingEvent(Base):
     detail: Mapped[dict | None] = mapped_column(JSONB)
     error: Mapped[str | None] = mapped_column(Text)
     duration_ms: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+
+
+# --- chat (conversation memory) -------------------------------------------
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL")
+    )
+    title: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+    updated_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+
+
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
+    )
+    role: Mapped[str] = mapped_column(message_role_enum, nullable=False)
+    content: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
+
+
+class RetrievalTrace(Base):
+    """Observability row written once per answered message.
+
+    Captures what the synthesis agent did (intent, searches, citations) and what it
+    cost (model, tokens, latency) so answers are auditable and ratings can attach to
+    a concrete retrieval. One row per assistant message; account-scoped.
+    """
+
+    __tablename__ = "retrieval_traces"
+
+    id: Mapped[uuid.UUID] = _uuid_pk()
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False
+    )
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), nullable=False
+    )
+    query_text: Mapped[str | None] = mapped_column(Text)
+    intent: Mapped[str | None] = mapped_column(Text)
+    retrieval_plan: Mapped[dict | None] = mapped_column(JSONB)
+    candidates: Mapped[dict | None] = mapped_column(JSONB)
+    reranked: Mapped[dict | None] = mapped_column(JSONB)
+    context_sent: Mapped[dict | None] = mapped_column(JSONB)
+    answer: Mapped[str | None] = mapped_column(Text)
+    citations: Mapped[dict | None] = mapped_column(JSONB)
+    model: Mapped[str | None] = mapped_column(Text)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[dt.datetime] = mapped_column(nullable=False, server_default=sql_text("now()"))
