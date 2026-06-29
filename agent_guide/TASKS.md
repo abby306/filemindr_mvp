@@ -37,19 +37,24 @@ Live backlog. Move items between sections; keep entries one line. `[ ]` todo, `[
 - [x] OCR cache keyed by file hash; language detection (langdetect / Vision locale); keep Vision block bboxes; `processing_events` logged; status → `ocr_done` (or `failed`).
 
 **Extraction**
-- [ ] Structured-output schema + single cheap LLM pass → card + atomic facts.
-- [ ] Write card tables; store `extraction_raw`; confidence routing to `needs_review`.
-- [ ] Embed atomic facts + summary (local model); `indexed` status.
+- [x] Structured-output schema + cheap LLM pass (DeepSeek, page-window chunked) → card + atomic facts.
+- [x] Write card tables; store `extraction_raw`; confidence routing to `needs_review`.
+- [x] Embed atomic facts + summary (`bge-base`, local); `indexed` status; both HNSW stages indexed.
 
-**Retrieval**
-- [ ] Metadata/SQL layer; FTS/BM25; two-stage vector; reranker; intent router.
-- [ ] Account-scoped throughout.
+**Retrieval** (service layer ✅)
+- [x] Intent router (rules); structured-first (typed_facts/dates/entities); FTS + typed-fact/entity exact-match; two-stage vector; RRF fusion (`retrieval.py`).
+- [x] Cross-encoder reranker (`bge-reranker-base`) blended with RRF, α=0.4 (`reranking.py`).
+- [x] Optional scoping (`document_ids`/`class_slug`); account-scoped throughout. Validated on a real 13-doc corpus (`doc_recall 1.00`).
 
-**Synthesis**
-- [ ] Grounded answers with citations; "unsupported" path; write `retrieval_traces`.
+**Synthesis** (service layer ✅)
+- [x] Agentic, corpus-aware grounded answers with citations + `supported` path (`synthesis.py`, Gemini 2.5 Flash + `find_documents`/`search`/`finish` tools).
+- [x] Conversation memory + `chat()` (`conversations.py`); document catalog (`catalog.py`); CLIs (`ask`, `chat`, `retrieve`, `eval_retrieval`, `seed_corpus`).
+- [x] Chat HTTP endpoints (`POST /conversations`, `POST /conversations/{id}/messages` incl. `scope="document"`, `GET /conversations/{id}/messages`); map `RetrievalTrace` ORM + write one `retrieval_traces` row per answer (`conversations.record_trace`).
+- [ ] SSE streaming (dedicated `POST /conversations/{id}/messages/stream`), GPT-4o hard-synthesis escalation, wire `synthesize` into `eval/`, fuller trace cols (candidates/reranked/context_sent). ← **Phase 5 remaining**
 
 **Quality**
-- [ ] Eval harness: gold queries, recall@k, answer correctness; run on every retrieval/prompt change.
+- [x] Eval harness scaffold: gold queries, recall@k, answer correctness (`eval/`); `scripts/eval_retrieval.py` scores live retrieval.
+- [ ] Wire `synthesize` into eval for `answer_correctness`; refresh gold set to real corpus UUIDs.
 
 **Frontend (design system in `FRONTEND.md` / design PDF)**
 - [ ] Design tokens → Tailwind/CSS vars (light + dark); Inter + Geist Mono; base components on Radix.

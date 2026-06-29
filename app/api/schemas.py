@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -68,3 +69,37 @@ class DocumentCardOut(DocumentOut):
     dates: list[DateCardOut] = []
     typed_facts: list[TypedFactCardOut] = []
     fact_count: int = 0
+
+
+# --- chat / conversations --------------------------------------------------
+class ConversationOut(BaseModel):
+    id: uuid.UUID
+
+
+class MessageCreate(BaseModel):
+    content: str
+    scope: Literal["account", "document"] | None = None
+    document_id: uuid.UUID | None = None
+
+
+class CitationOut(BaseModel):
+    document_id: uuid.UUID
+    title: str | None = None
+    page: int | None = None
+    fact_id: uuid.UUID | None = None
+
+
+class MessageAnswerOut(BaseModel):
+    message_id: uuid.UUID
+    answer: str
+    citations: list[CitationOut] = []
+    supported: bool
+
+
+class MessageOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    role: str
+    content: str | None
+    created_at: dt.datetime
