@@ -107,6 +107,32 @@ class EntityGroups(BaseModel):
     organizations: list[str] = []
     places: list[str] = []
 
+    @field_validator("people", "organizations", "places", mode="before")
+    @classmethod
+    def _coerce_names(cls, value):
+        """Tolerate the model returning entity objects instead of plain strings.
+
+        DeepSeek sometimes emits ``[{"name": "South Supermarket"}]`` instead of
+        ``["South Supermarket"]``. Flatten dicts (preferring name/value/text keys),
+        keep non-empty strings, and drop anything else — so one odd shape never
+        fails the whole document.
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            value = [value]
+        names: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                name = item.strip()
+            elif isinstance(item, dict):
+                name = str(item.get("name") or item.get("value") or item.get("text") or "").strip()
+            else:
+                name = ""
+            if name:
+                names.append(name)
+        return names
+
 
 class DatePrediction(BaseModel):
     model_config = ConfigDict(extra="ignore")

@@ -169,6 +169,23 @@ def test_parse_extraction_strips_code_fences() -> None:
     assert extraction.parse_extraction(fenced).title == "T"
 
 
+def test_parse_extraction_coerces_entity_objects() -> None:
+    # DeepSeek sometimes returns entities as {"name": ...} objects, not strings.
+    raw = json.dumps(
+        {
+            "entities": {
+                "people": [{"name": "Daine Genevie Sebastian"}, "Plain Name", {"x": 1}, ""],
+                "organizations": [{"name": "South Supermarket"}],
+                "places": "Sta Rosa, Laguna",  # not even a list
+            }
+        }
+    )
+    result = extraction.parse_extraction(raw)
+    assert result.entities.people == ["Daine Genevie Sebastian", "Plain Name"]  # object→name, junk dropped
+    assert result.entities.organizations == ["South Supermarket"]
+    assert result.entities.places == ["Sta Rosa, Laguna"]  # scalar wrapped into a list
+
+
 def test_bbox_for_fact_matches_native_pdf_blocks() -> None:
     # A text-layer PDF now carries block bboxes (4-vertex polygons); the matcher
     # attaches one to a fact that overlaps a block, and nothing to an unrelated one.
