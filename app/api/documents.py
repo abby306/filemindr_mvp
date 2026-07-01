@@ -176,15 +176,29 @@ async def upload_document(
 def list_documents(
     scope: AccountScope = Depends(get_current_account),
     status_filter: str | None = Query(default=None, alias="status"),
+    class_filter: str | None = Query(default=None, alias="class"),
     limit: int = Query(default=50, ge=1, le=200),
     cursor: str | None = Query(default=None),
 ) -> DocumentListOut:
-    """List the active account's documents, newest first (keyset paginated)."""
+    """List the active account's documents, newest first (keyset paginated).
+
+    Optional `status` and `class` (slug) filters; `class` restricts to documents
+    labelled with that class in the active account.
+    """
     query = scope.select(Document).order_by(
         Document.created_at.desc(), Document.id.desc()
     )
     if status_filter is not None:
         query = query.where(Document.status == status_filter)
+    if class_filter is not None:
+        query = query.where(
+            Document.id.in_(
+                scope.select(DocumentClass)
+                .join(Class, Class.id == DocumentClass.class_id)
+                .where(Class.slug == class_filter)
+                .with_only_columns(DocumentClass.document_id)
+            )
+        )
     if cursor is not None:
         cur_created, cur_id = _decode_cursor(cursor)
         query = query.where(
