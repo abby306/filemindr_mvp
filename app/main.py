@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.classes import router as classes_router
 from app.api.conversations import router as conversations_router
 from app.api.documents import router as documents_router
 from app.core.config import get_settings
@@ -27,6 +28,7 @@ app = FastAPI(title="filemindr", version="0.1.0")
 
 app.include_router(documents_router)
 app.include_router(conversations_router)
+app.include_router(classes_router)
 
 # Dev-only: serve the throwaway testing UI same-origin (no CORS) at /dev/. Inert in
 # any non-development env and when the (git-ignored) dev_ui/ directory is absent.

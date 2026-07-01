@@ -112,7 +112,7 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
 - **`schemas.py`** — Pydantic response models. `DocumentOut` (id, status, source, original_filename, mime_type, byte_size, title, summary, language, page_count, created_at — `from_attributes=True`) is the light list/ingest view. `DocumentListOut` (items + next_cursor). **`DocumentCardOut`** (extends `DocumentOut`) adds `classes` (`ClassCardOut` slug/name/confidence), `entities` (`EntitiesCardOut` people/orgs/places), `dates` (`DateCardOut`), `typed_facts` (`TypedFactCardOut`; `value_type`→`type`), and `fact_count` — returned by the document-detail endpoint.
 - **`documents.py`** — `APIRouter(prefix="/api/v1")`. Endpoints:
   - `POST /documents` — multipart upload. `_resolve_mime` (header → extension fallback); 415 if unsupported. **Streams** the upload via `save_stream` in a threadpool with `max_upload_mb` cap → **413** if over cap, **400** if empty. **Dedup** on `(account_id, file_hash)` (returns existing with **200**); else insert `Document` at `received`, `record_event(received, succeeded)`, commit, then **schedule `ocr.run_ocr` as a `BackgroundTask`**, return **201**.
-  - `GET /documents` — account-scoped list, newest first, `status` filter, **keyset pagination** (opaque base64 cursor of `(created_at, id)`), `limit` 1–200.
+  - `GET /documents` — account-scoped list, newest first, `status` **and `class`** (slug) filters, **keyset pagination** (opaque base64 cursor of `(created_at, id)`), `limit` 1–200.
   - `GET /documents/{id}` — account-scoped detail returning the **full `DocumentCardOut`** (`_build_card` assembles classes/entities/dates/typed_facts/`fact_count` via scoped queries); **404** for another account's doc. Card sections are empty until extraction runs.
 - **`conversations.py`** — `APIRouter(prefix="/api/v1")`, chat surface (thin wrappers over `services/conversations`). Endpoints:
   - `POST /conversations` → **201** `{id}` (scoped to the active account).
@@ -120,10 +120,11 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
   - `POST /conversations/{id}/messages/stream` — same inputs, but **SSE** (`text/event-stream`): emits `intent` → `find_documents`/`searching` → (`escalating`) → `done` (final answer+citations). Validates scope/conversation up front, then streams `conversations.chat_stream`.
   - `GET /conversations/{id}/messages` — account-scoped full history (oldest-first `MessageOut[]`); **404** for an unknown/foreign conversation.
   - `POST /messages/{id}/rating` — attach feedback `{rating:"up"|"down", stars?, reasons?, comment?}` → writes `answer_ratings` (account-scoped, **404** for a foreign/unknown message); returns `{ok:true}`.
-- **`schemas.py`** also has chat models: `ConversationOut`, `MessageCreate`, `CitationOut`, `MessageAnswerOut`, `MessageOut`, `MessageRatingIn`, `OkOut`.
+- **`classes.py`** — `APIRouter(prefix="/api/v1")`, class-catalog management. `GET /classes` (account's classes, system first, each with `document_count` via one grouped query), `POST /classes` (`{name, description?}` → slug derived by `_slugify`; **409** on slug conflict incl. system-slug collision, **400** on empty slug; `is_system=false`), `DELETE /classes/{id}` (**404** if not in account, **409** if `is_system` — system classes immutable; cascades `document_classes` links). The `Class` ORM was already mapped; **no migration**.
+- **`schemas.py`** also has chat models (`ConversationOut`, `MessageCreate`, `CitationOut`, `MessageAnswerOut`, `MessageOut`, `MessageRatingIn`, `OkOut`) and class models (`ClassOut`, `ClassCreate`).
 
 ### `app/main.py`
-FastAPI app. `app.include_router(documents_router)` + `app.include_router(conversations_router)`. **Dev-only:** when `app_env == "development"` **and** a (git-ignored) `dev_ui/` dir exists, mounts it at **`/dev/`** (`StaticFiles`, same-origin) for the throwaway testing UI — inert otherwise. `GET /health` (unauth; `SELECT 1` DB check → 200/503). `GET /api/v1/me` (auth+scoping demo, returns user+account). **Note:** FastAPI 0.138 represents included routers as a lazy `_IncludedRouter` in `app.routes`; verify routes via `app.openapi()["paths"]`, not by scanning `app.routes`.
+FastAPI app. `app.include_router(...)` for documents, conversations, and classes. **Dev-only:** when `app_env == "development"` **and** a (git-ignored) `dev_ui/` dir exists, mounts it at **`/dev/`** (`StaticFiles`, same-origin) for the throwaway testing UI — inert otherwise. `GET /health` (unauth; `SELECT 1` DB check → 200/503). `GET /api/v1/me` (auth+scoping demo, returns user+account). **Note:** FastAPI 0.138 represents included routers as a lazy `_IncludedRouter` in `app.routes`; verify routes via `app.openapi()["paths"]`, not by scanning `app.routes`.
 
 ### `scripts/`
 - **`seed.py`** — idempotent `python -m scripts.seed`. Creates dev user (`abdullahasad70@gmail.com`), personal + company accounts, memberships (both `owner`), and the 14 system classes per account. Prints the dev-user UUID (bearer token) + account UUIDs.
@@ -141,7 +142,7 @@ FastAPI app. `app.include_router(documents_router)` + `app.include_router(conver
 - **`gold/seed.yaml`** — 8 illustrative queries across the 4 intents, grounded in the Phase-3/4 sample docs (`expected_doc_ids` are slugs → map to real UUIDs in a seeded eval corpus).
 - **`run.py`** — `python -m eval.run [--k N] [--gold path]`; scores a `retrieve(query)` callable, ships a fixture stub. **Phase 5 wiring point** documented in the README.
 
-### `tests/` (167 tests, all live-DB; every network/model seam mocked)
+### `tests/` (179 tests, all live-DB; every network/model seam mocked)
 - **`conftest.py`** — `db` fixture (session, **rolls back**); `seeded_account` fixture (commits a throwaway user + personal/company accounts + memberships, yields their ids, cascade-deletes on teardown).
 - **`test_config.py`** — settings load, caching, env overrides, defaults.
 - **`test_db.py`** — engine connects, pgvector present, `get_db` yields a session.
@@ -163,6 +164,7 @@ FastAPI app. `app.include_router(documents_router)` + `app.include_router(conver
 - **`test_conversations.py`** — create/history roundtrip, windowed + ordered, account-scoped, foreign-account rejected; **`chat`** persists both turns + passes prior history, **writes a `retrieval_traces` row**, and **threads `document_ids`** (synthesize stubbed).
 - **`test_conversations_api.py`** — chat HTTP surface (synthesize/`synthesize_iter` stubbed): create (201 + auth gate); `POST messages` returns answer/citations/supported + persists messages + **writes the trace row**; unknown/foreign conversation → 404; `scope="document"` (400 no id / 404 bad doc / threads `document_ids`); `GET messages` history + account isolation; **`POST messages/stream`** returns `text/event-stream`, emits intent→searching→done, persists messages + one trace (and 404s an unknown conversation up front).
 - **`test_ratings_api.py`** — `POST /messages/{id}/rating` persists (rating/stars/reasons/comment); minimal thumbs-up; **404** unknown/foreign message; **422** bad enum; account isolation.
+- **`test_classes_api.py`** — `GET /classes` (empty + auth + `document_count`); `POST` (slug derivation, **409** duplicate, **400** empty slug); `DELETE` (custom 204, **409** system-immutable, **404** unknown); account isolation; **`GET /documents?class=<slug>`** filter.
 
 ---
 

@@ -52,6 +52,7 @@ Live backlog. Move items between sections; keep entries one line. `[ ]` todo, `[
 - [x] Chat HTTP endpoints (`POST /conversations`, `POST /conversations/{id}/messages` incl. `scope="document"`, `GET /conversations/{id}/messages`); map `RetrievalTrace` ORM + write one `retrieval_traces` row per answer (`conversations.record_trace`).
 - [x] SSE streaming (`POST /conversations/{id}/messages/stream` via `synthesize_iter`); GPT-4o hard-synthesis escalation on `supported=false`; `scripts/eval_synthesis.py` (answer_correctness); fuller trace cols (candidates/context_sent). **Phase 5 complete.**
 - [x] Ratings endpoint `POST /messages/{id}/rating` + `AnswerRating` ORM (pulled forward from Phase 7 for testing); dev-only testing UI at `/dev/` (uncommitted `dev_ui/`).
+- [x] Class-catalog API: `GET/POST/DELETE /classes` (custom classes, system immutable) + `GET /documents?class=<slug>` filter (per `API_CONTRACTS.md`). New classes apply to the *next* extraction; existing docs need re-extraction to be re-classified.
 
 **Quality**
 - [x] Eval harness scaffold: gold queries, recall@k, answer correctness (`eval/`); `scripts/eval_retrieval.py` scores live retrieval.

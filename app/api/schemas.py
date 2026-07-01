@@ -71,6 +71,21 @@ class DocumentCardOut(DocumentOut):
     fact_count: int = 0
 
 
+# --- classes (catalog management) ------------------------------------------
+class ClassOut(BaseModel):
+    id: uuid.UUID
+    slug: str
+    name: str
+    description: str | None = None
+    is_system: bool
+    document_count: int = 0
+
+
+class ClassCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    description: str | None = None
+
+
 # --- chat / conversations --------------------------------------------------
 class ConversationOut(BaseModel):
     id: uuid.UUID
