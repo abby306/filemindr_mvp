@@ -2,9 +2,13 @@
 
 > **Purpose:** a self-contained handoff for the next agent/session. Read this before touching code so you don't have to re-traverse the whole repo. Update it at the end of each development cycle.
 >
-> **Last updated:** 2026-06-29 · after **Phase 5 service layer** + the **chat HTTP surface** (conversation endpoints + `retrieval_traces` writes + document-scoped chat) — over hybrid retrieval (intent router + structured/lexical/vector + RRF), **cross-encoder reranking**, **agentic corpus-aware synthesis** (Gemini 2.5 Flash + tools), and **conversation memory** · branch `main` (commits pending) · prior push at `462a72c`.
+> **Last updated:** 2026-06-30 · **Phase 5 fully complete and merged to `main`** — hybrid retrieval (intent router + structured/lexical/vector + RRF) → cross-encoder reranking → **agentic synthesis** (Gemini 2.5 Flash) with **GPT-4o escalation**, conversation memory, and the full chat HTTP surface (endpoints + **SSE streaming** + `retrieval_traces` writes + ratings). README brought current.
 >
-> **Verified on a real 13-doc corpus** (`scripts/seed_corpus.py` → live OCR/DeepSeek/bge): `doc_recall 1.00` on the gold set; live multi-turn chat answers accurate with citations and working "it"-style follow-ups. **145 tests passing, offline.**
+> **Git state:** `main` holds everything through PR #4 (merged: chat HTTP · SSE/escalation/ratings/eval · README · extraction entity-coercion fix). **One branch is unmerged — `feat/classes-api` (PR #5): the class-catalog API + `?class=` document filter — awaiting the owner's local test then merge.** Nothing else pending; working tree clean.
+>
+> **Verified on a real 23-doc corpus** (`scripts/seed_corpus.py` → live OCR/DeepSeek/bge; invoices, bank statement, receipts, NDA, technical plans, thesis, lab work): live chat answers accurate with grouped citations, `supported` flag, and working "it"-style follow-ups; GPT-4o escalation verified live. **179 tests passing, offline.**
+>
+> **Temporary testing UI (NOT committed — localhost only):** `dev_ui/index.html` is a throwaway single-file vanilla HTML/JS harness for the owner to test retrieval by hand — served same-origin at **`/dev/`** in development. It is **git-ignored on purpose** (`dev_ui/` in `.gitignore`); do not commit it or treat it as the real frontend (that's Phase 6, Next.js). It exercises: document list, **class browser (filter docs by class, create/delete custom classes)**, **per-document card view** (classes+confidence, entities, dates, typed facts), chat with live SSE steps, and the 👍/👎+stars+reasons rating widget.
 
 ---
 
@@ -28,10 +32,10 @@ Authoritative design docs live in [`agent_guide/`](agent_guide/): `PRD.md` → `
 | 6 — Frontend (Next.js) | ⏭️ Pending | Upload / Document view / Ask / Ratings |
 | 7 — Analytics + billing | ⏭️ Pending | usage counters, plans, quotas |
 
-- **Tests:** 167 passing (`pytest -q`). Run against the **live local Postgres**. Offline — Vision, DeepSeek, the bge encoder/reranker, **and the Gemini + GPT-4o synthesis seams** are all mocked.
+- **Tests:** 179 passing (`pytest -q`) on `main` + the `feat/classes-api` branch. Run against the **live local Postgres**. Offline — Vision, DeepSeek, the bge encoder/reranker, **and the Gemini + GPT-4o synthesis seams** are all mocked.
 - **Document pipeline status flow:** `received → ocr_done → extracted → indexed` (+ `failed` / `needs_review`). The full chain auto-runs on upload: OCR → extraction → embedding. **Every successfully-extracted doc is embedded** (so it is retrievable); confident docs reach **`indexed`**, low-confidence ones are embedded but **stay `needs_review`** (searchable + flagged for human review). Stuck/`failed` docs can be re-driven idempotently (`scripts/reprocess.py`).
 - **Resilience:** transient DeepSeek/Vision failures are retried (bounded backoff); a single failing chunk/page is skipped + recorded rather than failing the whole doc (only all-fail → `failed`). Per-chunk extraction and per-page OCR run with bounded concurrency. Uploads stream to disk with a size cap.
-- **DB:** 22 tables + `v_document_pipeline` view; migration `0002` adds the `documents.summary_embedding` HNSW index (both vector stages now indexed — see §6). Seed: 1 dev user, personal + company accounts, 14 system classes each, **0 documents** (load a corpus with `python -m scripts.seed_corpus`, which ingests `storage/samples/*` through the live pipeline).
+- **DB:** 22 tables + `v_document_pipeline` view; migration `0002` adds the `documents.summary_embedding` HNSW index (both vector stages now indexed — see §6). `python -m scripts.seed` creates 1 dev user, personal + company accounts, 14 system classes each, 0 documents. **The Personal account currently holds a live 23-doc corpus** (loaded via `python -m scripts.seed_corpus`; 21 `indexed`, 2 `needs_review`, 0 failed; 468 atomic facts). Re-run `seed_corpus` (idempotent) to reload.
 - **New dependency:** `google-genai` (Gemini SDK) — `pip install google-genai` (no `requirements.txt` in repo; deps live in the venv). Needs `GEMINI_API_KEY` in `.env` (set). Vision creds are now wired explicitly from settings (`config.vision_credentials_path` → `ocr._vision_client`) — image OCR no longer depends on an ambient `GOOGLE_APPLICATION_CREDENTIALS` env var.
 
 ---
@@ -45,8 +49,8 @@ Authoritative design docs live in [`agent_guide/`](agent_guide/): `PRD.md` → `
 ```bash
 source .venv/bin/activate
 python -m scripts.seed            # idempotent: dev user, 2 accounts, default classes
-uvicorn app.main:app --reload     # serves on :8000
-pytest -q                         # 37 tests
+uvicorn app.main:app --reload     # serves on :8000 (dev UI at /dev/ if dev_ui/ exists)
+pytest -q                         # 179 tests
 ```
 
 **Secrets** (in `.env`, git-ignored — all four set & verified working): `OPENAI_API_KEY`, `DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS` (→ `secrets/vision-credentials.json`). `.env.example` lists the keys without values. **Never commit secrets**; `.gitignore` covers `.env`, `secrets/`, `storage/`, `*credentials*.json`, `*-key.json`.
@@ -91,7 +95,7 @@ X-Account-Id:  86f4f4bf-a499-470a-a0ce-3b303601ca53          # personal account
   - Dataclasses: `OcrBlock(text, bbox)`, `OcrPage(page, text, blocks)`, `OcrResult(engine, page_count, language, text, pages)` with `to_cache`/`from_cache`.
   - **On `ocr_done` success, `run_ocr` chains `extraction.run_extraction(document_id, account_id)`** (local import to avoid a cycle; extraction opens its own session and swallows its own failures, so the committed OCR result is never disturbed).
 - **`extraction.py`** — Phase-3 extraction brain. Key pieces:
-  - `parse_extraction(raw) → ExtractionResult` — **pure, lenient, unit-tested**: clamps confidence to [0,1], coerces `value_numeric`, bad enums → defaults (`value_type`→`string`, date `role`→`mentioned`), unparseable dates → null, strips stray code fences. Pydantic sub-models: `ClassPrediction`, `EntityGroups`, `DatePrediction`, `TypedFactPrediction`, `AtomicFactPrediction`.
+  - `parse_extraction(raw) → ExtractionResult` — **pure, lenient, unit-tested**: clamps confidence to [0,1], coerces `value_numeric`, bad enums → defaults (`value_type`→`string`, date `role`→`mentioned`), unparseable dates → null, strips stray code fences, and **coerces entity objects `{"name": "X"}` → `"X"`** (DeepSeek sometimes returns nested entities; without this one odd shape failed the whole doc — found live on a receipt). Pydantic sub-models: `ClassPrediction`, `EntityGroups` (has the entity-name `mode="before"` validator), `DatePrediction`, `TypedFactPrediction`, `AtomicFactPrediction`.
   - **Page-window chunking (long docs):** `chunk_pages(pages, budget=14k) → [PageChunk]` packs whole pages (never split) into chunks marked with `===== PAGE n =====`; `merge_results([ExtractionResult]) → ExtractionResult` unions the per-chunk cards (classes keep max confidence/slug; entities/dates/typed/atomic facts deduped; title/summary = first non-empty). Both **pure + unit-tested**. A doc under budget is a single chunk (one call) — unchanged behavior; only long docs fan out. This fixed multi-page coverage (the 20-page sample went from facts truncated at page 10 → facts across all 20 pages; the 5-page NDA from 1/5 → 5/5 pages covered).
   - `build_messages(text, classes)` — pure; hard safety ceiling 50k chars/call; injects the account's class catalog (slug: description) and instructs the model to attribute each fact to its `===== PAGE n =====` marker.
   - **`call_extraction_model(text, classes) → (raw_json, model_name)`** — the **only network seam** (DeepSeek via `OpenAI(base_url=…)`, `response_format=json_object`, temp 0). Wrapped in `with_retry` (`_is_transient_llm` predicate); chunks are extracted **in parallel** (`map_bounded`, cap `max_parallel_calls`) with results kept in chunk order. **Partial-tolerant:** a chunk that fails after retries is recorded in `extraction_raw.failed_chunks` + event detail and skipped; only an all-chunk failure → `failed`. Monkeypatched in tests.
@@ -216,7 +220,7 @@ Cost discipline: cheap model for extraction, strong only for hard synthesis, loc
 
 ## 8. Next steps
 
-**Phase 5 — DONE at the service layer** (all in `app/services/`, all mocked in tests): intent router + structured-first + lexical (FTS + typed-fact/entity exact match) + two-stage vector + RRF (`retrieval.py`); cross-encoder rerank blended with RRF (`reranking.py`); agentic corpus-aware synthesis with citations + `supported` flag (`synthesis.py`); document catalog / `find_documents` (`catalog.py`); conversation memory + `chat()` (`conversations.py`). Validated on a real 13-doc corpus.
+**Phase 5 — DONE at the service layer** (all in `app/services/`, all mocked in tests): intent router + structured-first + lexical (FTS + typed-fact/entity exact match) + two-stage vector + RRF (`retrieval.py`); cross-encoder rerank blended with RRF (`reranking.py`); agentic corpus-aware synthesis with citations + `supported` flag (`synthesis.py`); document catalog / `find_documents` (`catalog.py`); conversation memory + `chat()` (`conversations.py`). Validated on a real corpus (now 23 docs).
 
 **Phase 5 — DONE (chat HTTP surface, PR1):**
 1. ✅ **Endpoints** (`app/api/conversations.py`, per `API_CONTRACTS.md`): `POST /conversations`, `POST /conversations/{id}/messages` (calls `conversations.chat`, supports `scope="document"`), `GET /conversations/{id}/messages`. Thin wrappers over the services; router wired in `main.py`.
@@ -228,7 +232,13 @@ Cost discipline: cheap model for extraction, strong only for hard synthesis, loc
 5. ✅ **Eval**: `scripts/eval_synthesis.py` runs `synthesize` over the gold set → `answer_correctness` measured. *(Gold set is still the illustrative scaffold — refresh to the real corpus when convenient.)*
 6. ✅ **Fuller traces**: `candidates` + enriched `retrieval_plan`/`context_sent` populated from `SynthesisResult.candidate_facts`/`plan`. (`reranked` stays null — reranking is internal to `retrieve`.)
 
-**Ratings (pulled forward from Phase 7 for the testing UI):** `POST /messages/{id}/rating` → `answer_ratings` (`AnswerRating` ORM, no migration). A **dev-only testing UI** lives (uncommitted) at `dev_ui/index.html`, served at `/dev/` in development.
+**Ratings (pulled forward from Phase 7 for the testing UI):** `POST /messages/{id}/rating` → `answer_ratings` (`AnswerRating` ORM, no migration).
+
+**Extraction robustness fix (PR #4, merged):** `EntityGroups` now coerces `{"name": X}` → `X` so a nested-entity shape never fails a whole doc (see §4 `extraction.py` / §9).
+
+**Class-catalog API — DONE on branch `feat/classes-api` (PR #5, NOT yet merged; awaiting owner test):** `GET/POST/DELETE /api/v1/classes` (list w/ per-class `document_count`, create custom w/ slug derivation, delete custom — system classes immutable) + `GET /documents?class=<slug>` filter. No migration (the `Class` ORM was already mapped). **Behavior:** a new class is picked up by the **next** extraction (its `description` is the classifier signal); **existing docs are not retroactively re-classified** — re-run `scripts.reprocess` / `run_extraction` to evaluate them against a new class.
+
+**Dev-only testing UI — uncommitted, temporary (see the header note):** `dev_ui/index.html`, served at `/dev/` in development, git-ignored. For hand-testing only; the real UI is Phase 6.
 
 **Phase 6 — Frontend (Next.js):** Upload / Document view / Ask (the chat UX) / Ratings. The conversation model, tool/event vocabulary, and document-reference affordances are now locked in code so the frontend won't need backend rework.
 
@@ -245,7 +255,8 @@ Cost discipline: cheap model for extraction, strong only for hard synthesis, loc
 - **List endpoint vs. contract** — `GET /documents` returns light `DocumentOut` items (not full cards) to avoid N+1; `API_CONTRACTS.md` shows `[DocumentCard]`. Detail returns the full card. Fine for now; batch-load if the list view needs card data.
 - **Gemini wired (Phase 5)** — `gemini_api_key` now drives the agentic synthesis client in `synthesis.py` (`google-genai`, model `gemini-2.5-flash`). Intent routing is rules-based (no LLM), not Gemini.
 - **Auth is dev-grade** (bearer = user UUID). Replace at the `get_current_user` seam before any real deployment; consider RLS as defence-in-depth alongside `AccountScope`. *(Owner doing security/auth deliberately later.)*
-- **Eval gold set is illustrative scaffold** — `eval/gold/seed.yaml` `expected_doc_ids` are slugs; `scripts/eval_retrieval.py` auto-maps them to real UUIDs by token overlap. `answer_correctness` isn't measured yet (synthesis not wired into the eval). Refresh the gold set to the real corpus and wire `synthesize` to close that.
+- **Eval gold set is illustrative scaffold** — `eval/gold/seed.yaml` `expected_doc_ids` are slugs; both eval scripts auto-map them to real UUIDs by token overlap. `answer_correctness` **is now measured** by `scripts/eval_synthesis.py` (runs `synthesize`); the remaining gap is that the gold set is still the old 8-query scaffold — **refresh it to the current 23-doc corpus** for meaningful numbers.
+- **Adding a class doesn't re-classify existing docs** — the class-catalog API (`feat/classes-api`) makes new classes visible to the *next* extraction only. There's no bulk "re-classify the corpus against the new class" action yet; the workaround is `python -m scripts.reprocess` (re-runs extraction). A future endpoint could re-extract just the docs that might match.
 - **Cold-start latency** — the first retrieval/answer after a restart loads the bge embedder **and** the bge-reranker (~30s observed); subsequent queries ~2.5–3s. Both are lazy CPU singletons. Consider a warmup call on boot, or GPU, if latency matters.
 - **Reranker is brittle (`bge-reranker-base`)** — it under-scores answers buried in a clause (scored *"…yielding a gross margin of ~75-80%"* ≈0.002) and can't read terse `label: value` structured text. Mitigated by the **consensus-primary blend** (α=0.4) + the `exact`-label boost in `retrieval.py`. If you want better, try `bge-reranker-v2-m3` (larger, slower) and re-tune α.
 - **`find_documents`/`search` tools rarely fire on small corpora** — by design: with ≤30 docs the corpus overview inlines the whole catalog, so the agent already has what it needs. They activate at scale (stats-only overview). Don't mistake "didn't search" for "broken".
@@ -254,3 +265,5 @@ Cost discipline: cheap model for extraction, strong only for hard synthesis, loc
 - **Vision credentials fixed this session** — `vision.ImageAnnotatorClient()` used to rely on an ambient `GOOGLE_APPLICATION_CREDENTIALS`; now `ocr._vision_client` builds explicit creds from `config.vision_credentials_path` (falls back to ADC if the file is missing). Image OCR (the receipt JPEGs) failed before this and were re-driven.
 - **No `requirements.txt`** — dependencies live only in the venv. `google-genai` was added this session via `pip install`. Consider freezing a manifest before the next environment rebuild.
 - **Conversation history is a fixed window (12 turns), unsummarized** — accepted for now (the user's own refinement is the correction mechanism). Revisit with summarization if long chats need to retain earlier context.
+- **GPT-4o escalation is live** — the `OPENAI_API_KEY` was rotated this session (old key had inactive billing → 429; new key verified working). Escalation is **best-effort**: if the hard model is unavailable it falls back to the honest Flash `supported=false` answer rather than failing the request (fixed after a live 429 crashed a stream mid-flight).
+- **Current corpus has 2 `needs_review` docs** (`Smart Mirror deployment.docx`, `timer2 tutorial.docx`) — fully searchable, just low classification confidence. 0 `failed`. The `.pptx` sample is skipped (unsupported); the two identical `inotech slides` docx deduped to one.
